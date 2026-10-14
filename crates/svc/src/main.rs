@@ -54,17 +54,23 @@ fn status(state: ServiceState, accept: ServiceControlAccept, code: u32, wait_hin
 fn run_as_service() -> Result<(), Box<dyn std::error::Error>> {
     let stop = Arc::new(AtomicBool::new(false));
     let h_stop = stop.clone();
+    let handback = Arc::new(AtomicBool::new(false));
+    let h_handback = handback.clone();
     let status_handle: Arc<OnceLock<ServiceStatusHandle>> = Arc::new(OnceLock::new());
     let h_status = status_handle.clone();
     let handle = service_control_handler::register(SERVICE_NAME, move |ctl| match ctl {
         ServiceControl::Stop | ServiceControl::Shutdown => {
+            // Only an explicit STOP hands SNetRBin back; SHUTDOWN keeps the takeover.
+            if matches!(ctl, ServiceControl::Stop) {
+                h_handback.store(true, Ordering::Relaxed);
+            }
             h_stop.store(true, Ordering::Relaxed);
             if let Some(h) = h_status.get() {
                 let _ = h.set_service_status(status(
                     ServiceState::StopPending,
                     ServiceControlAccept::empty(),
                     0,
-                    Duration::from_secs(10),
+                    Duration::from_secs(40),
                 ));
             }
             ServiceControlHandlerResult::NoError
@@ -76,10 +82,15 @@ fn run_as_service() -> Result<(), Box<dyn std::error::Error>> {
     let accept = ServiceControlAccept::STOP | ServiceControlAccept::SHUTDOWN;
     handle.set_service_status(status(ServiceState::Running, accept, 0, Duration::default()))?;
 
-    // A bad/missing config exits here, before any SCM takeover: SNetRBin is untouched.
-    let result = Config::load(Path::new(CONFIG_PATH))
-        .map_err(|e| e.to_string())
-        .and_then(|cfg| service::run(cfg, stop, true).map_err(|e| e.to_string()));
+    // A bad/missing config exits before any takeover. If a previous takeover left a
+    // state file, SNetRBin is handed back first; otherwise the SCM is never touched.
+    let result = match Config::load(Path::new(CONFIG_PATH)) {
+        Ok(cfg) => service::run(cfg, stop, handback, true).map_err(|e| e.to_string()),
+        Err(e) => {
+            service::early_exit_restore_service();
+            Err(e.to_string())
+        }
+    };
     let code = match &result {
         Ok(()) => 0,
         Err(e) => {
@@ -95,12 +106,19 @@ fn run_console(takeover: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     let cfg = Config::load(Path::new(CONFIG_PATH))?;
     let stop = Arc::new(AtomicBool::new(false));
-    let c_stop = stop.clone();
-    ctrlc::set_handler(move || c_stop.store(true, Ordering::Relaxed))?;
+    let handback = Arc::new(AtomicBool::new(false));
+    let (c_stop, c_hand) = (stop.clone(), handback.clone());
+    // Ctrl+C acts like STOP; it hands back only when this run took over.
+    ctrlc::set_handler(move || {
+        if takeover {
+            c_hand.store(true, Ordering::Relaxed);
+        }
+        c_stop.store(true, Ordering::Relaxed);
+    })?;
     if takeover {
         tracing::warn!("--takeover: SNetRBin will be stopped and disabled");
     }
-    service::run(cfg, stop, takeover)?;
+    service::run(cfg, stop, handback, takeover)?;
     Ok(())
 }
 

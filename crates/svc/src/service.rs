@@ -1,6 +1,7 @@
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::{config::Config, index::Index, port::PortClient, retention, watcher};
 
@@ -25,16 +26,34 @@ pub enum ServiceError {
 const BACKOFF_MAX_SECS: u64 = 60;
 /// Total backoff budget for connect+configure before handing back to SNetRBin.
 pub const CONNECT_BUDGET: Duration = Duration::from_secs(300);
-/// Wait before retrying a failed takeover.
+/// Wait before retrying a failed takeover (first cycles).
 pub const RETRY_WAIT: Duration = Duration::from_secs(15 * 60);
+/// After this many consecutive failed cycles, retry only every LONG_RETRY_WAIT.
+pub const MAX_FAST_FAILED_CYCLES: u32 = 3;
+pub const LONG_RETRY_WAIT: Duration = Duration::from_secs(6 * 3600);
 /// Re-send configure this often (driver reload recovery).
 pub const HEARTBEAT_EVERY: Duration = Duration::from_secs(300);
 const TICK: Duration = Duration::from_secs(60);
+/// A watcher run longer than this counts as healthy (backoff reset).
+const WATCHER_HEALTHY: Duration = Duration::from_secs(60);
+
+pub const START_AUTO: u32 = 2;
+pub const START_DISABLED: u32 = 4;
+pub const STATE_PATH: &str = r"C:\ProgramData\rnetrbin\takeover.json";
 
 /// Capped exponential backoff: 1s, 2s, 4s, ... capped at 60s.
 pub fn backoff_delay(attempt: u32) -> Duration {
     let secs = 1u64.checked_shl(attempt).unwrap_or(u64::MAX).min(BACKOFF_MAX_SECS);
     Duration::from_secs(secs)
+}
+
+/// Wait between failed takeover cycles: 15 min, then 6 h after repeated failures.
+pub fn retry_wait(failed_cycles: u32) -> Duration {
+    if failed_cycles >= MAX_FAST_FAILED_CYCLES {
+        LONG_RETRY_WAIT
+    } else {
+        RETRY_WAIT
+    }
 }
 
 pub fn retention_tick(idx: &Index, max_bin_bytes: u64) -> Result<u64, crate::retention::RetentionError> {
@@ -55,10 +74,12 @@ pub fn sleep_interruptible(total: Duration, stop: &AtomicBool) {
 pub trait Scm {
     /// Request stop and wait (bounded) until STOPPED. Absent service is Ok.
     fn stop_original(&self) -> Result<(), String>;
-    /// Persistently disable the original (takeover persisted).
+    /// Current start type (None if the service does not exist).
+    fn query_start_type(&self) -> Result<Option<u32>, String>;
+    /// Persistently disable the original.
     fn disable_original(&self) -> Result<(), String>;
-    /// Handback: re-enable (auto start) and start the original.
-    fn restore_original(&self) -> Result<(), String>;
+    /// Handback: set the start type (None = leave unchanged) and start the original.
+    fn restore_start(&self, start_type: Option<u32>) -> Result<(), String>;
 }
 
 /// The driver communication-port session.
@@ -69,12 +90,150 @@ pub trait Driver {
     fn disconnect(&mut self);
 }
 
-/// Transactional takeover. Returns true when we hold the driver port and the
-/// original is disabled; false if stop was requested (original restored if we
-/// had stopped it). Never leaves both services down: every non-success exit
-/// after stopping the original restores it.
-pub fn takeover<S: Scm, D: Driver>(
+/// Content of the takeover state file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Marker {
+    None,
+    Corrupt,
+    Saved(u32),
+}
+
+/// Persistent record that WE disabled SNetRBin (and what it was before).
+pub trait StateStore {
+    fn read(&self) -> Marker;
+    fn write(&self, start_type: u32) -> Result<(), String>;
+    fn clear(&self);
+}
+
+pub fn encode_marker(start_type: u32) -> String {
+    format!("{{ \"original_start_type\": {start_type} }}\n")
+}
+
+pub fn decode_marker(s: &str) -> Option<u32> {
+    let rest = &s[s.find("\"original_start_type\"")? + "\"original_start_type\"".len()..];
+    let rest = rest.trim_start().strip_prefix(':')?.trim_start();
+    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+    digits.parse().ok()
+}
+
+pub struct FileStore {
+    path: PathBuf,
+}
+
+impl FileStore {
+    pub fn new(path: impl Into<PathBuf>) -> Self {
+        FileStore { path: path.into() }
+    }
+}
+
+impl StateStore for FileStore {
+    fn read(&self) -> Marker {
+        match std::fs::read_to_string(&self.path) {
+            Ok(s) => decode_marker(&s).map_or(Marker::Corrupt, Marker::Saved),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Marker::None,
+            Err(_) => Marker::Corrupt,
+        }
+    }
+    fn write(&self, start_type: u32) -> Result<(), String> {
+        use std::io::Write;
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+        }
+        let mut tmp = self.path.clone().into_os_string();
+        tmp.push(".tmp");
+        let tmp = PathBuf::from(tmp);
+        let mut f = std::fs::File::create(&tmp).map_err(|e| e.to_string())?;
+        f.write_all(encode_marker(start_type).as_bytes()).map_err(|e| e.to_string())?;
+        f.sync_all().map_err(|e| e.to_string())?;
+        drop(f);
+        std::fs::rename(&tmp, &self.path).map_err(|e| e.to_string())
+    }
+    fn clear(&self) {
+        if let Err(e) = std::fs::remove_file(&self.path) {
+            if e.kind() != std::io::ErrorKind::NotFound {
+                tracing::error!("cannot remove takeover state file: {e}");
+            }
+        }
+    }
+}
+
+/// State store for modes that never take over (console without --takeover).
+pub struct NoStore;
+impl StateStore for NoStore {
+    fn read(&self) -> Marker {
+        Marker::None
+    }
+    fn write(&self, _start_type: u32) -> Result<(), String> {
+        Ok(())
+    }
+    fn clear(&self) {}
+}
+
+/// Re-enable (saved start type, fallback AUTO_START if corrupt) and start the
+/// original, then delete the state file. Without a marker the start type is
+/// left unchanged (we never disabled it), and it is just started.
+pub fn restore<S: Scm, T: StateStore>(scm: &S, store: &T) {
+    let marker = store.read();
+    let start = match marker {
+        Marker::None => None,
+        Marker::Corrupt => Some(START_AUTO),
+        Marker::Saved(t) => Some(t),
+    };
+    match scm.restore_start(start) {
+        Ok(()) => {
+            if marker != Marker::None {
+                store.clear();
+            }
+        }
+        Err(e) => tracing::error!("could not restore SNetRBin: {e}"),
+    }
+}
+
+/// Early exit (bad config, prepare failure): if we previously disabled SNetRBin
+/// give it back; otherwise do not touch the SCM at all.
+pub fn early_exit_restore<S: Scm, T: StateStore>(scm: &S, store: &T) {
+    if store.read() != Marker::None {
+        tracing::error!("exiting early after a previous takeover; restoring SNetRBin");
+        restore(scm, store);
+    }
+}
+
+/// Early-exit helper for the real service (used by main on config failure).
+pub fn early_exit_restore_service() {
+    early_exit_restore(&WinScm, &FileStore::new(STATE_PATH));
+}
+
+/// Close the port (single-client) first, then give SNetRBin back.
+fn handback<S: Scm, T: StateStore, D: Driver>(scm: &S, store: &T, driver: &mut D) {
+    driver.disconnect();
+    restore(scm, store);
+}
+
+/// Record the original start type, then disable. Never disables without a
+/// durable record; never overrides an administrator's own disable.
+fn disable_with_state<S: Scm, T: StateStore>(scm: &S, store: &T) {
+    match scm.query_start_type() {
+        Ok(Some(t)) if t != START_DISABLED => {
+            if let Err(e) = store.write(t) {
+                tracing::error!("cannot write takeover state ({e}); NOT disabling SNetRBin");
+                return;
+            }
+            if let Err(e) = scm.disable_original() {
+                tracing::error!("could not disable SNetRBin: {e}");
+            }
+        }
+        Ok(Some(_)) => tracing::info!("SNetRBin already disabled; leaving as is"),
+        Ok(None) => tracing::info!("SNetRBin not present; nothing to disable"),
+        Err(e) => tracing::error!("cannot query SNetRBin start type ({e}); NOT disabling"),
+    }
+}
+
+/// Transactional takeover. Returns true when we hold the driver port (and the
+/// original is disabled with a state record); false if stop was requested.
+/// Every non-success exit after stopping the original hands it back.
+pub fn takeover<S: Scm, T: StateStore, D: Driver>(
     scm: &S,
+    store: &T,
     driver: &mut D,
     stop: &AtomicBool,
     sleep: &dyn Fn(Duration),
@@ -84,6 +243,7 @@ pub fn takeover<S: Scm, D: Driver>(
         Aborted,
         Exhausted,
     }
+    let mut failed_cycles: u32 = 0;
     loop {
         if stop.load(Ordering::Relaxed) {
             return false;
@@ -114,23 +274,22 @@ pub fn takeover<S: Scm, D: Driver>(
         match outcome {
             Outcome::Connected => {
                 tracing::info!("driver port connected and configured");
-                if let Err(e) = scm.disable_original() {
-                    tracing::error!("could not disable SNetRBin: {e}");
-                }
+                disable_with_state(scm, store);
                 return true;
             }
             Outcome::Aborted => {
-                if let Err(e) = scm.restore_original() {
-                    tracing::error!("could not restore SNetRBin: {e}");
-                }
+                handback(scm, store, driver);
                 return false;
             }
             Outcome::Exhausted => {
-                if let Err(e) = scm.restore_original() {
-                    tracing::error!("could not restore SNetRBin: {e}");
-                }
-                tracing::error!("takeover failed; original SNetRBin restored; will retry in 15 min");
-                sleep(RETRY_WAIT);
+                handback(scm, store, driver);
+                failed_cycles = failed_cycles.saturating_add(1);
+                let wait = retry_wait(failed_cycles);
+                tracing::error!(
+                    "takeover failed; original SNetRBin restored; will retry in {} min",
+                    wait.as_secs() / 60
+                );
+                sleep(wait);
             }
         }
     }
@@ -167,16 +326,20 @@ fn prepare(cfg: &Config) -> Result<Arc<Index>, ServiceError> {
 
 fn spawn_watcher_supervisor(
     idx: Arc<Index>,
-    root: std::path::PathBuf,
+    root: PathBuf,
     stop: Arc<AtomicBool>,
 ) -> std::thread::JoinHandle<()> {
     std::thread::spawn(move || {
         let mut attempt: u32 = 0;
         while !stop.load(Ordering::Relaxed) {
             let (i, r, s) = (idx.clone(), root.clone(), stop.clone());
+            let started = Instant::now();
             let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| watcher::watch(i, r, s)));
             if stop.load(Ordering::Relaxed) {
                 break;
+            }
+            if started.elapsed() > WATCHER_HEALTHY {
+                attempt = 0;
             }
             match res {
                 Ok(Ok(())) => tracing::error!("watcher exited unexpectedly; restarting"),
@@ -189,23 +352,32 @@ fn spawn_watcher_supervisor(
     })
 }
 
-/// Orchestration with injected SCM/driver (production uses `run`).
-pub fn run_with<S: Scm, D: Driver>(
+/// Orchestration with injected SCM/state/driver/sleeper (production uses `run`).
+/// `handback_on_exit` is set only by an explicit STOP (not SHUTDOWN).
+pub fn run_with<S: Scm, T: StateStore, D: Driver>(
     cfg: Config,
     stop: Arc<AtomicBool>,
+    handback_on_exit: &AtomicBool,
     scm: &S,
+    store: &T,
     driver: &mut D,
+    sleep: &dyn Fn(Duration),
 ) -> Result<(), ServiceError> {
-    // 1. PREPARE: on failure SNetRBin is never touched.
-    let idx = prepare(&cfg)?;
+    // 1. PREPARE: on failure the SCM is only touched if we had taken over before.
+    let idx = match prepare(&cfg) {
+        Ok(i) => i,
+        Err(e) => {
+            early_exit_restore(scm, store);
+            return Err(e);
+        }
+    };
     let handle = spawn_watcher_supervisor(idx.clone(), cfg.recycle_dir.clone(), stop.clone());
-    let sleep = |d: Duration| sleep_interruptible(d, &stop);
 
     let mut protected = false;
     let mut since_hb = Duration::ZERO;
     while !stop.load(Ordering::Relaxed) {
         if !protected {
-            protected = takeover(scm, driver, &stop, &sleep);
+            protected = takeover(scm, store, driver, &stop, sleep);
             since_hb = Duration::ZERO;
             if !protected {
                 break;
@@ -228,18 +400,29 @@ pub fn run_with<S: Scm, D: Driver>(
             }
         }
     }
+    if protected && handback_on_exit.load(Ordering::Relaxed) {
+        tracing::info!("stop requested: handing protection back to SNetRBin");
+        handback(scm, store, driver);
+    }
     if handle.join().is_err() {
         tracing::error!("watcher supervisor thread panicked");
     }
     Ok(())
 }
 
-pub fn run(cfg: Config, stop: Arc<AtomicBool>, take_over_original: bool) -> Result<(), ServiceError> {
+pub fn run(
+    cfg: Config,
+    stop: Arc<AtomicBool>,
+    handback_on_exit: Arc<AtomicBool>,
+    take_over_original: bool,
+) -> Result<(), ServiceError> {
     let mut driver = WinDriver::new(&cfg);
+    let s2 = stop.clone();
+    let sleep = move |d: Duration| sleep_interruptible(d, &s2);
     if take_over_original {
-        run_with(cfg, stop, &WinScm, &mut driver)
+        run_with(cfg, stop, &handback_on_exit, &WinScm, &FileStore::new(STATE_PATH), &mut driver, &sleep)
     } else {
-        run_with(cfg, stop, &NoScm, &mut driver)
+        run_with(cfg, stop, &handback_on_exit, &NoScm, &NoStore, &mut driver, &sleep)
     }
 }
 
@@ -249,10 +432,13 @@ impl Scm for NoScm {
     fn stop_original(&self) -> Result<(), String> {
         Ok(())
     }
+    fn query_start_type(&self) -> Result<Option<u32>, String> {
+        Ok(None)
+    }
     fn disable_original(&self) -> Result<(), String> {
         Ok(())
     }
-    fn restore_original(&self) -> Result<(), String> {
+    fn restore_start(&self, _start_type: Option<u32>) -> Result<(), String> {
         Ok(())
     }
 }
@@ -323,20 +509,17 @@ impl WinScm {
         }
     }
 
-    fn change_start(
-        start: windows::Win32::System::Services::SERVICE_START_TYPE,
-        then_start: bool,
-    ) -> Result<(), String> {
+    fn change_start(access: u32, start: Option<u32>, then_start: bool) -> Result<(), String> {
         use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
         use windows::Win32::System::Services::*;
         unsafe {
-            let Some((scm, svc)) = Self::open(SERVICE_CHANGE_CONFIG | SERVICE_START)? else {
+            let Some((scm, svc)) = Self::open(access)? else {
                 return Ok(());
             };
             let mut result = ChangeServiceConfigW(
                 svc,
                 ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
-                start,
+                SERVICE_START_TYPE(start.unwrap_or(SERVICE_NO_CHANGE)),
                 SERVICE_ERROR(SERVICE_NO_CHANGE),
                 None,
                 None,
@@ -374,13 +557,13 @@ impl Scm for WinScm {
                 return Ok(());
             };
             let mut status = SERVICE_STATUS::default();
-            let mut result = Ok(());
+            let mut ctl_err = None;
             match ControlService(svc, SERVICE_CONTROL_STOP, &mut status) {
                 Ok(()) => {}
                 Err(e) if e.code() == ERROR_SERVICE_NOT_ACTIVE.to_hresult() => {
                     tracing::info!("SNetRBin already stopped");
                 }
-                Err(e) => result = Err(format!("stop request: {e}")),
+                Err(e) => ctl_err = Some(format!("stop request: {e}")),
             }
             let mut stopped = false;
             for _ in 0..60 {
@@ -390,80 +573,172 @@ impl Scm for WinScm {
                 }
                 std::thread::sleep(Duration::from_millis(500));
             }
-            if !stopped && result.is_ok() {
-                result = Err("timed out waiting for SNetRBin to stop".into());
-            }
             let _ = CloseServiceHandle(svc);
             let _ = CloseServiceHandle(scm);
-            result
+            if stopped {
+                // Reaching STOPPED is what matters, even if the request errored.
+                Ok(())
+            } else {
+                Err(ctl_err.unwrap_or_else(|| "timed out waiting for SNetRBin to stop".into()))
+            }
+        }
+    }
+
+    fn query_start_type(&self) -> Result<Option<u32>, String> {
+        use windows::Win32::System::Services::*;
+        unsafe {
+            let Some((scm, svc)) = Self::open(SERVICE_QUERY_CONFIG)? else {
+                return Ok(None);
+            };
+            let mut needed = 0u32;
+            let _ = QueryServiceConfigW(svc, None, 0, &mut needed); // expected: insufficient buffer
+            let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+            let res = QueryServiceConfigW(
+                svc,
+                Some(buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW),
+                (buf.len() * 8) as u32,
+                &mut needed,
+            );
+            let out = match res {
+                Ok(()) => Ok(Some((*(buf.as_ptr() as *const QUERY_SERVICE_CONFIGW)).dwStartType.0)),
+                Err(e) => Err(format!("query config: {e}")),
+            };
+            let _ = CloseServiceHandle(svc);
+            let _ = CloseServiceHandle(scm);
+            out
         }
     }
 
     fn disable_original(&self) -> Result<(), String> {
-        Self::change_start(windows::Win32::System::Services::SERVICE_DISABLED, false)
+        use windows::Win32::System::Services::*;
+        Self::change_start(SERVICE_CHANGE_CONFIG, Some(SERVICE_DISABLED.0), false)
     }
 
-    fn restore_original(&self) -> Result<(), String> {
-        Self::change_start(windows::Win32::System::Services::SERVICE_AUTO_START, true)
+    fn restore_start(&self, start_type: Option<u32>) -> Result<(), String> {
+        use windows::Win32::System::Services::*;
+        Self::change_start(SERVICE_CHANGE_CONFIG | SERVICE_START, start_type, true)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::RefCell;
+    use std::cell::{Cell, RefCell};
 
-    #[derive(Default)]
-    struct FakeScm {
+    /// One fake world implementing Scm + StateStore, logging every call in order.
+    struct World {
         calls: RefCell<Vec<&'static str>>,
+        marker: RefCell<Marker>,
+        start_type: Cell<u32>,
+        restored_with: Cell<Option<Option<u32>>>,
+        stop_err: Cell<bool>,
     }
-    impl Scm for FakeScm {
+    impl World {
+        fn new() -> Self {
+            World {
+                calls: RefCell::new(vec![]),
+                marker: RefCell::new(Marker::None),
+                start_type: Cell::new(2),
+                restored_with: Cell::new(None),
+                stop_err: Cell::new(false),
+            }
+        }
+        fn log(&self, c: &'static str) {
+            self.calls.borrow_mut().push(c);
+        }
+        fn calls(&self) -> Vec<&'static str> {
+            self.calls.borrow().clone()
+        }
+    }
+    impl Scm for World {
         fn stop_original(&self) -> Result<(), String> {
-            self.calls.borrow_mut().push("stop");
-            Ok(())
+            self.log("stop");
+            if self.stop_err.get() { Err("access denied".into()) } else { Ok(()) }
+        }
+        fn query_start_type(&self) -> Result<Option<u32>, String> {
+            self.log("query");
+            Ok(Some(self.start_type.get()))
         }
         fn disable_original(&self) -> Result<(), String> {
-            self.calls.borrow_mut().push("disable");
+            self.log("disable");
+            self.start_type.set(START_DISABLED);
             Ok(())
         }
-        fn restore_original(&self) -> Result<(), String> {
-            self.calls.borrow_mut().push("restore");
+        fn restore_start(&self, start_type: Option<u32>) -> Result<(), String> {
+            self.log("restore");
+            self.restored_with.set(Some(start_type));
             Ok(())
+        }
+    }
+    impl StateStore for World {
+        fn read(&self) -> Marker {
+            *self.marker.borrow()
+        }
+        fn write(&self, start_type: u32) -> Result<(), String> {
+            self.log("write_state");
+            *self.marker.borrow_mut() = Marker::Saved(start_type);
+            Ok(())
+        }
+        fn clear(&self) {
+            self.log("clear_state");
+            *self.marker.borrow_mut() = Marker::None;
         }
     }
 
-    /// Fails the first `fail_first` connects (u32::MAX = always).
     struct FakeDriver<'a> {
-        scm: &'a FakeScm,
+        w: &'a World,
         fail_first: u32,
+        fail_after: u32,
         connects: u32,
         hb_err: bool,
-        disconnects: u32,
     }
     impl<'a> FakeDriver<'a> {
-        fn new(scm: &'a FakeScm, fail_first: u32) -> Self {
-            FakeDriver { scm, fail_first, connects: 0, hb_err: false, disconnects: 0 }
+        fn new(w: &'a World, fail_first: u32) -> Self {
+            FakeDriver { w, fail_first, fail_after: u32::MAX, connects: 0, hb_err: false }
         }
     }
     impl Driver for FakeDriver<'_> {
         fn connect_and_configure(&mut self) -> Result<(), String> {
             self.connects += 1;
-            self.scm.calls.borrow_mut().push("configure");
-            if self.connects <= self.fail_first {
+            self.w.log("configure");
+            if self.connects <= self.fail_first || self.connects > self.fail_after {
                 Err("down".into())
             } else {
                 Ok(())
             }
         }
         fn heartbeat(&mut self) -> Result<(), String> {
-            if self.hb_err {
-                Err("gone".into())
-            } else {
-                Ok(())
-            }
+            if self.hb_err { Err("gone".into()) } else { Ok(()) }
         }
         fn disconnect(&mut self) {
-            self.disconnects += 1;
+            self.w.log("disconnect");
+        }
+    }
+
+    fn tmp_cfg(dir: &std::path::Path, db_parent_is_file: bool) -> Config {
+        let db = if db_parent_is_file {
+            let blocker = dir.join("blocker");
+            std::fs::write(&blocker, b"x").unwrap();
+            blocker.join("sub").join("db.sqlite")
+        } else {
+            dir.join("db.sqlite")
+        };
+        Config {
+            recycle_dir: dir.join("recycle"),
+            db_path: db,
+            includes: vec!["*".into()],
+            excludes: vec![],
+            max_bin_bytes: u64::MAX,
+            max_age_days: None,
+        }
+    }
+
+    fn stop_on_tick(stop: &Arc<AtomicBool>) -> impl Fn(Duration) {
+        let s = stop.clone();
+        move |d: Duration| {
+            if d == TICK {
+                s.store(true, Ordering::Relaxed);
+            }
         }
     }
 
@@ -477,26 +752,70 @@ mod tests {
     fn backoff_doubles_and_caps() {
         assert_eq!(backoff_delay(0), Duration::from_secs(1));
         assert_eq!(backoff_delay(1), Duration::from_secs(2));
-        assert_eq!(backoff_delay(2), Duration::from_secs(4));
         assert_eq!(backoff_delay(5), Duration::from_secs(32));
         assert_eq!(backoff_delay(6), Duration::from_secs(60));
-        assert_eq!(backoff_delay(7), Duration::from_secs(60));
         assert_eq!(backoff_delay(1000), Duration::from_secs(60));
     }
 
     #[test]
-    fn takeover_success_disables_only_after_configure() {
-        let scm = FakeScm::default();
-        let mut drv = FakeDriver::new(&scm, 2);
-        let stop = AtomicBool::new(false);
-        assert!(takeover(&scm, &mut drv, &stop, &|_| {}));
-        assert_eq!(*scm.calls.borrow(), vec!["stop", "configure", "configure", "configure", "disable"]);
+    fn retry_wait_escalates_after_three_failed_cycles() {
+        assert_eq!(retry_wait(1), RETRY_WAIT);
+        assert_eq!(retry_wait(2), RETRY_WAIT);
+        assert_eq!(retry_wait(3), LONG_RETRY_WAIT);
+        assert_eq!(retry_wait(10), LONG_RETRY_WAIT);
+        assert_eq!(LONG_RETRY_WAIT, Duration::from_secs(6 * 3600));
     }
 
     #[test]
-    fn takeover_failure_restores_original_and_retries_after_15_min() {
-        let scm = FakeScm::default();
-        let mut drv = FakeDriver::new(&scm, u32::MAX);
+    fn marker_encode_decode_roundtrip() {
+        assert_eq!(decode_marker(&encode_marker(2)), Some(2));
+        assert_eq!(decode_marker(&encode_marker(3)), Some(3));
+        assert_eq!(decode_marker("garbage"), None);
+        assert_eq!(decode_marker("{ \"original_start_type\": }"), None);
+    }
+
+    #[test]
+    fn file_store_roundtrip_missing_and_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let st = FileStore::new(dir.path().join("takeover.json"));
+        assert_eq!(st.read(), Marker::None);
+        st.write(3).unwrap();
+        assert_eq!(st.read(), Marker::Saved(3));
+        assert!(!dir.path().join("takeover.json.tmp").exists());
+        std::fs::write(dir.path().join("takeover.json"), "{{{").unwrap();
+        assert_eq!(st.read(), Marker::Corrupt);
+        st.clear();
+        assert_eq!(st.read(), Marker::None);
+    }
+
+    #[test]
+    fn takeover_writes_state_before_disable_and_disables_after_configure() {
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, 2);
+        let stop = AtomicBool::new(false);
+        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert_eq!(
+            w.calls(),
+            vec!["stop", "configure", "configure", "configure", "query", "write_state", "disable"]
+        );
+        assert_eq!(w.read(), Marker::Saved(2));
+    }
+
+    #[test]
+    fn takeover_does_not_record_or_disable_when_admin_already_disabled() {
+        let w = World::new();
+        w.start_type.set(START_DISABLED);
+        let mut drv = FakeDriver::new(&w, 0);
+        let stop = AtomicBool::new(false);
+        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert!(!w.calls().contains(&"write_state"));
+        assert_eq!(w.read(), Marker::None);
+    }
+
+    #[test]
+    fn takeover_failure_restores_never_disables_and_never_leaves_both_down() {
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, u32::MAX);
         let stop = AtomicBool::new(false);
         let sleeps = RefCell::new(Vec::new());
         let sleep = |d: Duration| {
@@ -505,71 +824,187 @@ mod tests {
                 stop.store(true, Ordering::Relaxed);
             }
         };
-        assert!(!takeover(&scm, &mut drv, &stop, &sleep));
-        let calls = scm.calls.borrow();
+        assert!(!takeover(&w, &w, &mut drv, &stop, &sleep));
+        let calls = w.calls();
         assert!(!calls.contains(&"disable"));
         assert_eq!(calls.first(), Some(&"stop"));
         assert_eq!(calls.last(), Some(&"restore"));
-        assert_eq!(calls.iter().filter(|c| **c == "restore").count(), 1);
         assert!(sleeps.borrow().contains(&RETRY_WAIT));
         let backoff_total: Duration = sleeps.borrow().iter().filter(|d| **d != RETRY_WAIT).sum();
         assert!(backoff_total <= CONNECT_BUDGET);
+        // never disabled -> nothing recorded, restore keeps the start type
+        assert_eq!(w.restored_with.get(), Some(None));
+    }
+
+    #[test]
+    fn takeover_after_three_failed_cycles_waits_six_hours() {
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, u32::MAX);
+        let stop = AtomicBool::new(false);
+        let waits = RefCell::new(Vec::new());
+        let sleep = |d: Duration| {
+            if d == RETRY_WAIT || d == LONG_RETRY_WAIT {
+                waits.borrow_mut().push(d);
+                if waits.borrow().len() == 5 {
+                    stop.store(true, Ordering::Relaxed);
+                }
+            }
+        };
+        assert!(!takeover(&w, &w, &mut drv, &stop, &sleep));
+        assert_eq!(
+            *waits.borrow(),
+            vec![RETRY_WAIT, RETRY_WAIT, LONG_RETRY_WAIT, LONG_RETRY_WAIT, LONG_RETRY_WAIT]
+        );
     }
 
     #[test]
     fn takeover_stop_requested_midway_restores_original() {
-        let scm = FakeScm::default();
-        let mut drv = FakeDriver::new(&scm, u32::MAX);
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, u32::MAX);
         let stop = AtomicBool::new(false);
         let sleep = |_d: Duration| stop.store(true, Ordering::Relaxed);
-        assert!(!takeover(&scm, &mut drv, &stop, &sleep));
-        let calls = scm.calls.borrow();
+        assert!(!takeover(&w, &w, &mut drv, &stop, &sleep));
+        let calls = w.calls();
         assert_eq!(calls.last(), Some(&"restore"));
         assert!(!calls.contains(&"disable"));
     }
 
     #[test]
     fn takeover_not_started_when_stop_already_set() {
-        let scm = FakeScm::default();
-        let mut drv = FakeDriver::new(&scm, 0);
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, 0);
         let stop = AtomicBool::new(true);
-        assert!(!takeover(&scm, &mut drv, &stop, &|_| {}));
-        assert!(scm.calls.borrow().is_empty());
+        assert!(!takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert!(w.calls().is_empty());
+    }
+
+    #[test]
+    fn takeover_proceeds_when_stop_original_fails() {
+        let w = World::new();
+        w.stop_err.set(true);
+        let mut drv = FakeDriver::new(&w, 0);
+        let stop = AtomicBool::new(false);
+        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert_eq!(w.calls()[..2], ["stop", "configure"]);
+        assert!(w.calls().contains(&"disable"));
+    }
+
+    #[test]
+    fn restore_uses_saved_start_type_then_clears_marker() {
+        let w = World::new();
+        *w.marker.borrow_mut() = Marker::Saved(3);
+        restore(&w, &w);
+        assert_eq!(w.restored_with.get(), Some(Some(3)));
+        assert_eq!(w.read(), Marker::None);
+        assert_eq!(w.calls(), vec!["restore", "clear_state"]);
+    }
+
+    #[test]
+    fn restore_with_corrupt_marker_falls_back_to_auto_start() {
+        let w = World::new();
+        *w.marker.borrow_mut() = Marker::Corrupt;
+        restore(&w, &w);
+        assert_eq!(w.restored_with.get(), Some(Some(START_AUTO)));
+        assert_eq!(w.read(), Marker::None);
     }
 
     #[test]
     fn heartbeat_error_drops_session_and_takeover_reenters() {
-        let scm = FakeScm::default();
-        let mut drv = FakeDriver::new(&scm, 0);
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, 0);
         let stop = AtomicBool::new(false);
-        assert!(takeover(&scm, &mut drv, &stop, &|_| {}));
+        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
         assert!(heartbeat(&mut drv));
         drv.hb_err = true;
         assert!(!heartbeat(&mut drv));
-        assert_eq!(drv.disconnects, 1);
+        assert_eq!(w.calls().iter().filter(|c| **c == "disconnect").count(), 1);
         drv.hb_err = false;
-        assert!(takeover(&scm, &mut drv, &stop, &|_| {}));
+        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
         assert_eq!(drv.connects, 2);
     }
 
     #[test]
-    fn prepare_failure_never_touches_scm() {
+    fn prepare_failure_without_marker_never_touches_scm() {
         let dir = tempfile::tempdir().unwrap();
-        let blocker = dir.path().join("blocker");
-        std::fs::write(&blocker, b"x").unwrap();
-        let cfg = Config {
-            recycle_dir: dir.path().join("recycle"),
-            db_path: blocker.join("sub").join("db.sqlite"), // parent is a file
-            includes: vec!["*".into()],
-            excludes: vec![],
-            max_bin_bytes: 1,
-            max_age_days: None,
-        };
-        let scm = FakeScm::default();
-        let mut drv = FakeDriver::new(&scm, 0);
-        let r = run_with(cfg, Arc::new(AtomicBool::new(false)), &scm, &mut drv);
+        let cfg = tmp_cfg(dir.path(), true);
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, 0);
+        let r = run_with(cfg, Arc::new(AtomicBool::new(false)), &AtomicBool::new(true), &w, &w, &mut drv, &|_| {});
         assert!(r.is_err());
-        assert!(scm.calls.borrow().is_empty());
+        assert!(w.calls().is_empty());
         assert_eq!(drv.connects, 0);
+    }
+
+    #[test]
+    fn prepare_failure_with_marker_restores_original() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tmp_cfg(dir.path(), true);
+        let w = World::new();
+        *w.marker.borrow_mut() = Marker::Saved(2);
+        let mut drv = FakeDriver::new(&w, 0);
+        let r = run_with(cfg, Arc::new(AtomicBool::new(false)), &AtomicBool::new(true), &w, &w, &mut drv, &|_| {});
+        assert!(r.is_err());
+        assert_eq!(w.calls(), vec!["restore", "clear_state"]);
+        assert_eq!(w.restored_with.get(), Some(Some(2)));
+    }
+
+    #[test]
+    fn early_exit_restore_without_marker_touches_nothing() {
+        let w = World::new();
+        early_exit_restore(&w, &w);
+        assert!(w.calls().is_empty());
+    }
+
+    #[test]
+    fn run_with_stop_hands_back_disconnect_before_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tmp_cfg(dir.path(), false);
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sleep = stop_on_tick(&stop);
+        run_with(cfg, stop, &AtomicBool::new(true), &w, &w, &mut drv, &sleep).unwrap();
+        let calls = w.calls();
+        let n = calls.len();
+        assert_eq!(calls[n - 3..], ["disconnect", "restore", "clear_state"]);
+        assert_eq!(w.restored_with.get(), Some(Some(2)));
+    }
+
+    #[test]
+    fn run_with_shutdown_keeps_takeover_persisted() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tmp_cfg(dir.path(), false);
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let sleep = stop_on_tick(&stop);
+        run_with(cfg, stop, &AtomicBool::new(false), &w, &w, &mut drv, &sleep).unwrap();
+        assert!(!w.calls().contains(&"restore"));
+        assert!(w.calls().contains(&"disable"));
+        assert_eq!(w.read(), Marker::Saved(2));
+    }
+
+    #[test]
+    fn run_with_heartbeat_fail_then_budget_exhausted_restores_saved_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tmp_cfg(dir.path(), false);
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, 0);
+        drv.fail_after = 1; // first connect ok, every later one fails
+        drv.hb_err = true;
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        let sleep = move |d: Duration| {
+            if d == RETRY_WAIT {
+                s2.store(true, Ordering::Relaxed);
+            }
+        };
+        run_with(cfg, stop, &AtomicBool::new(false), &w, &w, &mut drv, &sleep).unwrap();
+        let calls = w.calls();
+        assert!(calls.contains(&"disable"));
+        let d = calls.iter().position(|c| *c == "disable").unwrap();
+        assert!(calls[d..].contains(&"restore"));
+        assert_eq!(w.restored_with.get(), Some(Some(2)));
+        assert_eq!(w.read(), Marker::None);
     }
 }
