@@ -49,6 +49,12 @@ impl Index {
     pub fn insert_with<E: From<rusqlite::Error>>(
         &self, f: &DeletedFile, post: impl FnOnce() -> Result<(), E>,
     ) -> Result<i64, E> {
+        self.insert_with_commit(f, "COMMIT", post)
+    }
+    /// Like insert_with but with an injectable COMMIT statement (tests force a commit failure).
+    pub(crate) fn insert_with_commit<E: From<rusqlite::Error>>(
+        &self, f: &DeletedFile, commit_sql: &str, post: impl FnOnce() -> Result<(), E>,
+    ) -> Result<i64, E> {
         let conn = self.c();
         conn.execute_batch("BEGIN IMMEDIATE")?;
         let res = (|| -> Result<i64, E> {
@@ -61,7 +67,10 @@ impl Index {
             Ok(id)
         })();
         match res {
-            Ok(id) => { conn.execute_batch("COMMIT")?; Ok(id) }
+            Ok(id) => match conn.execute_batch(commit_sql) {
+                Ok(()) => Ok(id),
+                Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e.into()) }
+            },
             Err(e) => { let _ = conn.execute_batch("ROLLBACK"); Err(e) }
         }
     }
@@ -93,6 +102,10 @@ impl Index {
         self.c().query_row(
             "SELECT original_path, backup_path, is_restored FROM deleted_files WHERE id=?1",
             [id], |r| Ok((r.get(0)?, r.get(1)?, r.get::<_, i64>(2)? != 0)))
+    }
+    #[cfg(test)]
+    pub fn deleted_utc(&self, id: i64) -> rusqlite::Result<i64> {
+        self.c().query_row("SELECT deleted_utc FROM deleted_files WHERE id=?1", [id], |r| r.get(0))
     }
     pub fn count_by_backup_path(&self, backup_path: &str) -> rusqlite::Result<i64> {
         self.c().query_row("SELECT COUNT(*) FROM deleted_files WHERE backup_path=?1",

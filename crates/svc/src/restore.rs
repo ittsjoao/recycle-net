@@ -15,6 +15,13 @@ pub enum RestoreError {
 /// (row kept as history) and deletes the backup file so it doesn't leak disk.
 /// The default target is created with create_new (never clobbers).
 pub fn restore(idx: &Index, id: i64, dest_override: Option<&Path>) -> Result<PathBuf, RestoreError> {
+    restore_with(idx, id, dest_override, |i, id| i.mark_restored(id))
+}
+
+fn restore_with(
+    idx: &Index, id: i64, dest_override: Option<&Path>,
+    mark: impl FnOnce(&Index, i64) -> rusqlite::Result<()>,
+) -> Result<PathBuf, RestoreError> {
     let (orig, backup, restored) = match idx.row_info(id) {
         Ok(r) => r,
         Err(rusqlite::Error::QueryReturnedNoRows) => return Err(RestoreError::NotFound),
@@ -45,7 +52,11 @@ pub fn restore(idx: &Index, id: i64, dest_override: Option<&Path>) -> Result<Pat
             return Err(e.into());
         }
     }
-    idx.mark_restored(id)?;
+    if let Err(e) = mark(idx, id) {
+        // undo only a target this call created (create_new); keep the backup
+        if dest_override.is_none() { let _ = std::fs::remove_file(&dest); }
+        return Err(e.into());
+    }
     if let Err(e) = std::fs::remove_file(&backup) {
         tracing::warn!("restored but could not delete backup {backup}: {e}");
     }
@@ -92,6 +103,20 @@ mod tests {
         fs::remove_file(&orig).unwrap();
         assert_eq!(restore(&idx, id, None).unwrap(), orig);
         assert_eq!(fs::read(&orig).unwrap(), b"data");
+    }
+    #[test]
+    fn mark_failure_removes_created_target_keeps_backup_and_retry_works() {
+        let dir = tempfile::tempdir().unwrap();
+        let bp = dir.path().join("b.bin");
+        fs::write(&bp, b"data").unwrap();
+        let orig = dir.path().join("o.bin");
+        let idx = Index::open_memory().unwrap();
+        let id = add(&idx, &orig.to_string_lossy(), &bp);
+        let r = restore_with(&idx, id, None, |_, _| Err(rusqlite::Error::InvalidQuery));
+        assert!(matches!(r, Err(RestoreError::Db(_))));
+        assert!(!orig.exists());
+        assert!(bp.exists());
+        assert_eq!(restore(&idx, id, None).unwrap(), orig);
     }
     #[test]
     fn relative_original_without_override_is_refused() {

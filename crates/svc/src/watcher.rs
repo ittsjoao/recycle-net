@@ -14,6 +14,10 @@ pub enum WatchError {
 
 const RECONCILE_INTERVAL: Duration = Duration::from_secs(60);
 
+fn is_db_file(p: &Path) -> bool {
+    ["db", "db-wal", "db-shm", "db-journal", "sqlite"].iter().any(|e| ext_is(p, e))
+}
+
 fn ext_is(p: &Path, want: &str) -> bool {
     p.extension().is_some_and(|x| x.to_string_lossy().eq_ignore_ascii_case(want))
 }
@@ -22,11 +26,20 @@ fn ext_is(p: &Path, want: &str) -> bool {
 /// Per-file errors are logged and skipped; returns the number of successes.
 pub fn reconcile(idx: &Index, recycle_root: &Path) -> Result<usize, FinalizeError> {
     let mut count = 0;
-    for entry in walk_candidates(recycle_root) {
+    let (candidates, others) = walk_candidates(recycle_root);
+    for entry in candidates {
         match finalize_one(idx, &entry, recycle_root) {
             Ok(Some(_)) => count += 1,
             Ok(None) => {}
             Err(e) => tracing::warn!("reconcile: failed to finalize {}: {e}", entry.display()),
+        }
+    }
+    // sweep: adopt finalized backup files that have no row (crash between rename and commit)
+    for f in others {
+        match crate::finalize::adopt_unindexed(idx, &f, recycle_root) {
+            Ok(Some(_)) => count += 1,
+            Ok(None) => {}
+            Err(e) => tracing::warn!("reconcile: failed to adopt {}: {e}", f.display()),
         }
     }
     Ok(count)
@@ -34,7 +47,8 @@ pub fn reconcile(idx: &Index, recycle_root: &Path) -> Result<usize, FinalizeErro
 
 /// `.nrbnew` paths to try; stale `.nrbflag` files map to their `.nrbnew` path.
 /// Symlinks/junctions are not followed.
-fn walk_candidates(root: &Path) -> Vec<PathBuf> {
+fn walk_candidates(root: &Path) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut others: Vec<PathBuf> = Vec::new();
     let mut out: Vec<PathBuf> = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(d) = stack.pop() {
@@ -46,12 +60,14 @@ fn walk_candidates(root: &Path) -> Vec<PathBuf> {
                 if ft.is_dir() { stack.push(p); }
                 else if ext_is(&p, "nrbnew") { out.push(p); }
                 else if ext_is(&p, "nrbflag") { out.push(p.with_extension("")); }
+                else if !is_db_file(&p) { others.push(p); }
             }
         }
     }
     out.sort();
     out.dedup();
-    out
+    others.sort();
+    (out, others)
 }
 
 pub fn watch(idx: Arc<Index>, recycle_root: PathBuf, stop: Arc<AtomicBool>) -> Result<(), WatchError> {
@@ -109,6 +125,19 @@ mod tests {
         let n = reconcile(&idx, dir.path()).unwrap();
         assert_eq!(n, 1);
         assert_eq!(idx.total_size().unwrap(), 2);
+    }
+    #[test]
+    fn sweep_adopts_unindexed_files_but_not_db_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("D");
+        fs::create_dir_all(&sub).unwrap();
+        fs::write(sub.join("lost.txt"), b"abc").unwrap();
+        fs::write(sub.join("empty.txt"), b"").unwrap();
+        fs::write(dir.path().join("index.db"), b"sqlite").unwrap();
+        let idx = crate::index::Index::open_memory().unwrap();
+        assert_eq!(reconcile(&idx, dir.path()).unwrap(), 1);
+        assert_eq!(idx.total_size().unwrap(), 3);
+        assert_eq!(reconcile(&idx, dir.path()).unwrap(), 0); // idempotent
     }
     #[test]
     fn reconcile_continues_after_a_bad_orphan() {
