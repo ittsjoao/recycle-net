@@ -139,7 +139,7 @@ mod tests {
         let idx = crate::index::Index::open_memory().unwrap();
         assert_eq!(reconcile(&idx, dir.path()).unwrap(), 0);
         assert_eq!(idx.total_size().unwrap(), 0);
-        crate::retention::enforce(&idx, 1).unwrap();
+        crate::retention::enforce(&idx, 1, None).unwrap();
         assert!(sub.join("user-data.xlsx").exists());
     }
     #[test]

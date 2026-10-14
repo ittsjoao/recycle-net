@@ -79,6 +79,14 @@ impl Index {
         self.c().query_row(
             "SELECT COALESCE(SUM(size),0) FROM deleted_files WHERE is_restored=0", [], |r| r.get(0))
     }
+    /// Non-restored rows with deleted_utc strictly before `cutoff` (id, backup_path, size).
+    pub fn older_than_unrestored(&self, cutoff: i64) -> rusqlite::Result<Vec<(i64,String,i64)>> {
+        let conn = self.c();
+        let mut st = conn.prepare(
+            "SELECT id,backup_path,size FROM deleted_files WHERE is_restored=0 AND deleted_utc < ?1 ORDER BY deleted_utc ASC, id ASC")?;
+        let rows = st.query_map([cutoff], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
     pub fn oldest_unrestored(&self, limit: usize) -> rusqlite::Result<Vec<(i64,String,i64)>> {
         let conn = self.c();
         let mut st = conn.prepare(

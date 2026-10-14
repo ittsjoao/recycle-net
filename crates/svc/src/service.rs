@@ -21,6 +21,8 @@ pub enum ServiceError {
     Finalize(#[from] crate::finalize::FinalizeError),
     #[error("prepare: {0}")]
     Prepare(#[from] std::io::Error),
+    #[error("config: {0}")]
+    Config(#[from] crate::config::ConfigError),
 }
 
 const BACKOFF_MAX_SECS: u64 = 60;
@@ -56,8 +58,8 @@ pub fn retry_wait(failed_cycles: u32) -> Duration {
     }
 }
 
-pub fn retention_tick(idx: &Index, max_bin_bytes: u64) -> Result<u64, crate::retention::RetentionError> {
-    retention::enforce(idx, max_bin_bytes)
+pub fn retention_tick(idx: &Index, max_bin_bytes: u64, max_age_days: Option<u32>) -> Result<u64, crate::retention::RetentionError> {
+    retention::enforce(idx, max_bin_bytes, max_age_days)
 }
 
 /// Sleep up to `total` in 1-second slices, returning early when `stop` is set.
@@ -315,7 +317,9 @@ pub fn heartbeat<D: Driver>(driver: &mut D) -> bool {
 
 /// Local fallible setup done BEFORE any SCM action.
 fn prepare(cfg: &Config) -> Result<Arc<Index>, ServiceError> {
-    std::fs::create_dir_all(&cfg.recycle_dir)?;
+    // Refuse a populated directory we did not create (drive/share root, another
+    // tool's bin) before anything is indexed or any SCM action happens.
+    crate::config::ensure_dedicated_dir(&cfg.recycle_dir)?;
     if let Some(parent) = cfg.db_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
@@ -389,7 +393,7 @@ pub fn run_with<S: Scm, T: StateStore, D: Driver>(
                 break;
             }
         }
-        match retention_tick(&idx, cfg.max_bin_bytes) {
+        match retention_tick(&idx, cfg.max_bin_bytes, cfg.max_age_days) {
             Ok(freed) if freed > 0 => tracing::info!("retention freed {freed} bytes"),
             Ok(_) => {}
             Err(e) => tracing::warn!("retention tick failed: {e}"),
@@ -484,7 +488,7 @@ impl Driver for WinDriver {
     }
     fn heartbeat(&mut self) -> Result<(), String> {
         match &self.port {
-            Some(p) => p.configure(&self.includes, &self.excludes, &self.log_dir).map_err(|e| e.to_string()),
+            Some(p) => p.reassert(&self.log_dir).map_err(|e| e.to_string()),
             None => Err("no port session".into()),
         }
     }
@@ -766,7 +770,7 @@ mod tests {
     #[test]
     fn retention_tick_never_over_max_frees_nothing() {
         let idx = crate::index::Index::open_memory().unwrap();
-        assert_eq!(retention_tick(&idx, u64::MAX).unwrap(), 0);
+        assert_eq!(retention_tick(&idx, u64::MAX, None).unwrap(), 0);
     }
 
     #[test]
@@ -953,6 +957,24 @@ mod tests {
         let r = run_with(cfg, Arc::new(AtomicBool::new(false)), &AtomicBool::new(true), &w, &w, &mut drv, &|_| {});
         assert!(r.is_err());
         assert!(w.calls().is_empty());
+        assert_eq!(drv.connects, 0);
+    }
+
+    #[test]
+    fn populated_unmarked_recycle_dir_refuses_start_before_scm() {
+        let dir = tempfile::tempdir().unwrap();
+        let cfg = tmp_cfg(dir.path(), false);
+        std::fs::create_dir_all(&cfg.recycle_dir).unwrap();
+        std::fs::write(cfg.recycle_dir.join("user-data.xlsx"), b"x").unwrap();
+        let w = World::new();
+        let mut drv = FakeDriver::new(&w, 0);
+        let stop = Arc::new(AtomicBool::new(false));
+        let s2 = stop.clone();
+        // If prepare wrongly succeeds, stop on the first sleep so the test fails instead of hanging.
+        let sleep = move |_d: Duration| s2.store(true, Ordering::Relaxed);
+        let r = run_with(cfg, stop, &AtomicBool::new(true), &w, &w, &mut drv, &sleep);
+        assert!(r.is_err());
+        assert!(w.calls().is_empty(), "SCM touched: {:?}", w.calls());
         assert_eq!(drv.connects, 0);
     }
 

@@ -239,7 +239,7 @@ mod tests {
         crate::watcher::reconcile(&idx, dir.path()).unwrap();
         assert!(!flag_path(&nrb).exists());
         assert_eq!(idx.total_size().unwrap(), 10);
-        let freed = crate::retention::enforce(&idx, 0).unwrap();
+        let freed = crate::retention::enforce(&idx, 0, None).unwrap();
         assert_eq!(freed, 10);
         assert!(!fin.exists());
     }

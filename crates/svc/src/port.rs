@@ -63,6 +63,15 @@ impl PortClient {
         self.send(cmd_code(Command::Setup), &encode_setup(true, log_dir))?;
         Ok(())
     }
+
+    /// Heartbeat: re-assert the monitor (SetupMonitor only). It must NOT send
+    /// Clear + masks — that would reopen a recurring window with no include
+    /// masks, and re-adding masks without Clear would grow the driver's list.
+    /// If the driver reloaded, the port is closed and this send fails, which
+    /// makes the caller drop the session and run a full `connect_and_configure`.
+    pub fn reassert(&self, log_dir: &str) -> Result<(), PortError> {
+        self.send(cmd_code(Command::Setup), &encode_setup(true, log_dir))
+    }
 }
 
 impl Drop for PortClient {

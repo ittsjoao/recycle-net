@@ -1,5 +1,3 @@
-use widestring::U16CString;
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command { AddInclude, AddExclude, Clear, Setup }
 
@@ -7,11 +5,12 @@ pub fn cmd_code(c: Command) -> i32 {
     match c { Command::AddInclude => 0, Command::AddExclude => 1, Command::Clear => 2, Command::Setup => 3 }
 }
 
+/// Nul-terminated UTF-16 LE mask. Never panics: masks are validated (no NUL)
+/// by `Config::validate` before any takeover, and an interior NUL here would
+/// only truncate the mask on the driver side.
 pub fn encode_mask(mask: &str) -> Vec<u8> {
-    let w = U16CString::from_str(mask).expect("no interior nul");
-    // units + terminating nul, little-endian bytes
-    let mut out = Vec::with_capacity((w.len() + 1) * 2);
-    for u in w.as_slice_with_nul() { out.extend_from_slice(&u.to_le_bytes()); }
+    let mut out = Vec::with_capacity((mask.len() + 1) * 2);
+    for u in mask.encode_utf16().chain(std::iter::once(0)) { out.extend_from_slice(&u.to_le_bytes()); }
     out
 }
 
@@ -32,6 +31,12 @@ pub struct Message { pub command: i32, pub payload: Vec<u8> }
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mask_with_interior_nul_does_not_panic() {
+        let b = encode_mask("*.\0x");
+        assert_eq!(&b[b.len() - 2..], &[0, 0]);
+    }
 
     #[test]
     fn mask_is_nul_terminated_utf16() {
