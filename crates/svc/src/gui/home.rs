@@ -9,46 +9,96 @@ use super::{icons, App, Msg};
 
 const BOLD: Font = Font { weight: font::Weight::Bold, ..Font::DEFAULT };
 
-/// Ribbon button: icon above the label; no message = disabled.
-pub(super) fn ribbon_button<'a>(p: Pal, icon: &str, label: &'a str, msg: Option<Msg>, danger: bool) -> Element<'a, Msg> {
-    let color = if msg.is_none() { p.muted } else if danger { p.danger } else { p.acc };
-    let content = column![icons::icon(icon, 26.0, color), text(label).size(12).align_x(Alignment::Center)]
-        .spacing(2)
-        .align_x(Alignment::Center)
-        .width(Length::Fixed(72.0));
-    let b = button(content).padding([4, 4]).style(theme::flat_button(p, false));
-    match msg {
-        Some(m) => b.on_press(m).into(),
-        None => b.into(),
-    }
+/// Every ribbon button has this box, so hover fills the same area everywhere.
+const BTN_W: f32 = 92.0;
+const BTN_H: f32 = 58.0;
+/// Height of one list/tree row.
+pub(super) const ROW_H: f32 = 26.0;
+
+/// One-line label: never wraps, so rows and buttons keep their fixed box.
+pub(super) fn label<'a>(s: impl text::IntoFragment<'a>, size: impl Into<iced::Pixels>) -> iced::widget::Text<'a> {
+    text(s).size(size).wrapping(text::Wrapping::None)
 }
 
-/// A labeled group of the ribbon, separated by a vertical line.
-pub(super) fn group<'a>(p: Pal, content: Element<'a, Msg>, caption: &'a str) -> Element<'a, Msg> {
-    container(column![container(content).height(Length::Fixed(58.0)), text(caption).size(11).color(p.muted)].align_x(Alignment::Center))
-        .padding([4, 10])
-        .style(move |_| iced::widget::container::Style {
-            border: iced::Border { color: p.line, width: 0.0, radius: 0.0.into() },
-            ..Default::default()
-        })
+/// Ribbon button: icon above the label in a fixed box; no message = disabled.
+pub(super) fn ribbon_button<'a>(p: Pal, icon: &str, caption: &'a str, msg: Option<Msg>, danger: bool) -> Element<'a, Msg> {
+    let color = if msg.is_none() { p.muted } else if danger { p.danger } else { p.acc };
+    let content = column![icons::icon(icon, 24.0, color), label(caption, 12)]
+        .spacing(4)
+        .align_x(Alignment::Center)
+        .width(Length::Fill);
+    button(container(content).center_y(Length::Fill))
+        .width(Length::Fixed(BTN_W))
+        .height(Length::Fixed(BTN_H))
+        .padding([4, 2])
+        .clip(true)
+        .style(theme::flat_button(p, false))
+        .on_press_maybe(msg)
         .into()
+}
+
+/// A ribbon group: content centered vertically in a fixed-height band, the
+/// caption under it on the same baseline as every other group's.
+pub(super) fn group<'a>(p: Pal, content: impl Into<Element<'a, Msg>>, caption: &'a str) -> Element<'a, Msg> {
+    column![container(content).center_y(Length::Fixed(BTN_H)), label(caption, 11).color(p.muted)]
+        .spacing(2)
+        .align_x(Alignment::Center)
+        .padding([4, 10])
+        .into()
+}
+
+/// The ribbon: groups separated by thin vertical lines, same on every tab.
+pub(super) fn ribbon_bar<'a>(p: Pal, groups: Vec<Element<'a, Msg>>) -> Element<'a, Msg> {
+    let mut r = row![].align_y(Alignment::Center);
+    for (i, g) in groups.into_iter().enumerate() {
+        if i > 0 {
+            r = r.push(
+                container(Space::new())
+                    .width(Length::Fixed(1.0))
+                    .height(Length::Fixed(BTN_H + 12.0))
+                    .style(move |_| container::Style {
+                        background: Some(iced::Background::Color(p.line)),
+                        ..Default::default()
+                    }),
+            );
+        }
+        r = r.push(g);
+    }
+    container(r).padding([2, 6]).width(Length::Fill).style(theme::surface(p, p.bg)).into()
+}
+
+/// A list/tree row: fixed height, full width, so hover and selection paint the whole box.
+pub(super) fn row_button<'a>(p: Pal, content: impl Into<Element<'a, Msg>>, selected: bool, msg: Msg) -> Element<'a, Msg> {
+    button(container(content).width(Length::Fill).center_y(Length::Fill))
+        .width(Length::Fill)
+        .height(Length::Fixed(ROW_H))
+        .padding([0, 6])
+        .clip(true)
+        .style(theme::flat_button(p, selected))
+        .on_press(msg)
+        .into()
+}
+
+/// A table cell of width `w` that clips what does not fit.
+pub(super) fn cell<'a>(content: impl Into<Element<'a, Msg>>, w: Length) -> Element<'a, Msg> {
+    container(content).width(w).clip(true).into()
 }
 
 fn ribbon(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
     let has_sel = !app.selected.is_empty() && !app.busy;
     let on = |m: Msg, ok: bool| ok.then_some(m);
-    container(
-        row![
+    ribbon_bar(
+        p,
+        vec![
             group(
                 p,
                 row![
                     icons::icon("search", 18.0, p.muted),
-                    text_input("Buscar nesta pasta e abaixo", &app.query).on_input(Msg::Search).width(Length::Fixed(220.0)),
+                    text_input("Buscar nesta pasta e abaixo", &app.query).on_input(Msg::Search).width(Length::Fixed(240.0)),
                 ]
-                .spacing(4)
-                .align_y(Alignment::Center)
-                .into(),
+                .spacing(6)
+                .align_y(Alignment::Center),
                 "Buscar na lixeira",
             ),
             group(
@@ -59,17 +109,13 @@ fn ribbon(app: &App) -> Element<'_, Msg> {
                     ribbon_button(p, "delete_forever", "Excluir", on(Msg::Purge, has_sel), true),
                     ribbon_button(p, "history", "Ver cópias", on(Msg::ShowCopies, has_sel), false),
                 ]
-                .into(),
+                .spacing(2),
                 "Ações",
             ),
-            group(p, ribbon_button(p, "refresh", "Atualizar", on(Msg::Refresh, !app.busy), false), " "),
-            group(p, checkbox(app.all_copies).label("Todas as cópias").on_toggle(Msg::AllCopies).into(), "Mostrar"),
-        ]
-        .align_y(Alignment::Start),
+            group(p, ribbon_button(p, "refresh", "Atualizar", on(Msg::Refresh, !app.busy), false), "Lista"),
+            group(p, checkbox(app.all_copies).label("Todas as cópias").on_toggle(Msg::AllCopies), "Mostrar"),
+        ],
     )
-    .width(Length::Fill)
-    .style(theme::surface(p, p.bg))
-    .into()
 }
 
 fn tree_nodes<'a>(app: &'a App, path: &str, depth: usize, out: &mut Vec<Element<'a, Msg>>) {
@@ -88,26 +134,32 @@ fn tree_nodes<'a>(app: &'a App, path: &str, depth: usize, out: &mut Vec<Element<
     } else {
         "folder"
     };
-    let label = if path.is_empty() {
+    let name = if path.is_empty() {
         "Lixeira".to_string()
     } else if is_root {
         path.to_string()
     } else {
         listing::split_path(path).0.to_string()
     };
-    let name = text(label).size(13).font(if is_root || path.is_empty() { BOLD } else { Font::DEFAULT });
+    let name = label(name, 13).font(if is_root || path.is_empty() { BOLD } else { Font::DEFAULT });
     let line = row![
         Space::new().width(Length::Fixed(depth as f32 * 14.0)),
-        button(text(marker).size(12)).padding([0, 3]).style(theme::flat_button(p, false)).on_press(Msg::ToggleNode(path.to_string())),
-        button(
-            row![icons::icon(icon, 16.0, p.acc), name, text(format!("({})", app.tree.info(path).count)).size(11).color(p.muted)]
+        button(container(label(marker, 12)).center(Length::Fill))
+            .width(Length::Fixed(18.0))
+            .height(Length::Fixed(ROW_H))
+            .padding(0)
+            .style(theme::flat_button(p, false))
+            .on_press(Msg::ToggleNode(path.to_string())),
+        row_button(
+            p,
+            row![icons::icon(icon, 16.0, p.acc), name, label(format!("({})", app.tree.info(path).count), 11).color(p.muted)]
                 .spacing(5)
                 .align_y(Alignment::Center),
-        )
-        .padding([1, 4])
-        .style(theme::flat_button(p, current))
-        .on_press(Msg::Go(path.to_string())),
+            current,
+            Msg::Go(path.to_string()),
+        ),
     ]
+    .width(Length::Fill)
     .align_y(Alignment::Center);
     out.push(line.into());
     if open {
@@ -164,11 +216,13 @@ const W_TIME: Length = Length::Fixed(130.0);
 
 fn header(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
-    let h = |label: &'static str, col: SortCol, w: Length| {
+    let h = |name: &'static str, col: SortCol, w: Length| {
         let arrow = if app.sort.0 == col { if app.sort.1 { " ▲" } else { " ▼" } } else { "" };
-        button(text(format!("{label}{arrow}")).size(12).color(p.muted))
-            .padding([3, 6])
+        button(container(label(format!("{name}{arrow}"), 12).color(p.muted)).center_y(Length::Fill))
+            .padding(0)
             .width(w)
+            .height(Length::Fixed(ROW_H))
+            .clip(true)
             .style(theme::flat_button(p, false))
             .on_press(Msg::Sort(col))
     };
@@ -179,33 +233,35 @@ fn header(app: &App) -> Element<'_, Msg> {
         h("Tamanho", SortCol::Size, W_SIZE),
         h("Apagado em", SortCol::Deleted, W_TIME),
     ]
+    // Same horizontal padding as `row_button`, so the columns line up.
+    .padding([0, 6])
+    .width(Length::Fill)
     .into()
 }
 
 fn rows(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
-    let cell = |s: String, w: Length| text(s).size(13).width(w);
-    let mut col = column![].spacing(1);
+    let txt = |s: String, w: Length| cell(label(s, 13), w);
+    let dim = |s: String, w: Length| cell(label(s, 13).color(p.muted), w);
+    let mut col = column![].spacing(1).width(Length::Fill);
     for d in &app.listing.dirs {
         let icon = if app.cur.is_empty() { "folder_special" } else { "folder" };
-        col = col.push(
-            button(
-                row![
-                    row![icons::icon(icon, 17.0, p.acc), text(d.name.clone()).size(13).font(BOLD)].spacing(6).width(W_NAME),
-                    cell(format!("{} apagado(s)", d.info.count), W_COPIES).color(p.muted),
-                    cell(String::new(), W_USER),
-                    cell(listing::fmt_size(d.info.size), W_SIZE).color(p.muted),
-                    cell(if d.info.count > 0 { listing::fmt_time(d.info.last) } else { String::new() }, W_TIME).color(p.muted),
-                ]
-                .align_y(Alignment::Center),
-            )
-            .padding([2, 6])
-            .style(theme::flat_button(p, false))
-            .on_press(Msg::Go(d.path.clone())),
-        );
+        col = col.push(row_button(
+            p,
+            row![
+                cell(row![icons::icon(icon, 17.0, p.acc), label(d.name.clone(), 13).font(BOLD)].spacing(6), W_NAME),
+                dim(format!("{} apagado(s)", d.info.count), W_COPIES),
+                txt(String::new(), W_USER),
+                dim(listing::fmt_size(d.info.size), W_SIZE),
+                dim(if d.info.count > 0 { listing::fmt_time(d.info.last) } else { String::new() }, W_TIME),
+            ]
+            .align_y(Alignment::Center),
+            false,
+            Msg::Go(d.path.clone()),
+        ));
     }
     for f in &app.listing.files {
-        let label = if app.query.trim().is_empty() && app.copies_of.is_none() {
+        let name = if app.query.trim().is_empty() && app.copies_of.is_none() {
             listing::split_path(&f.original_path).0.to_string()
         } else if app.cur.is_empty() {
             f.original_path.clone()
@@ -213,24 +269,22 @@ fn rows(app: &App) -> Element<'_, Msg> {
             f.original_path.get(app.cur.len() + 1..).unwrap_or(&f.original_path).to_string()
         };
         let user = match &f.user_name {
-            Some(u) => cell(u.clone(), W_USER),
-            None => cell("desconhecido".into(), W_USER).color(p.muted),
+            Some(u) => txt(u.clone(), W_USER),
+            None => dim("desconhecido".into(), W_USER),
         };
-        col = col.push(
-            button(
-                row![
-                    row![icons::icon("description", 17.0, p.acc), text(label).size(13)].spacing(6).width(W_NAME),
-                    cell(if f.copies > 1 { f.copies.to_string() } else { "-".into() }, W_COPIES),
-                    user,
-                    cell(listing::fmt_size(f.size), W_SIZE),
-                    cell(listing::fmt_time(f.deleted_utc), W_TIME),
-                ]
-                .align_y(Alignment::Center),
-            )
-            .padding([2, 6])
-            .style(theme::flat_button(p, app.selected.contains(&f.id)))
-            .on_press(Msg::Click(f.id)),
-        );
+        col = col.push(row_button(
+            p,
+            row![
+                cell(row![icons::icon("description", 17.0, p.acc), label(name, 13)].spacing(6), W_NAME),
+                txt(if f.copies > 1 { f.copies.to_string() } else { "-".into() }, W_COPIES),
+                user,
+                txt(listing::fmt_size(f.size), W_SIZE),
+                txt(listing::fmt_time(f.deleted_utc), W_TIME),
+            ]
+            .align_y(Alignment::Center),
+            app.selected.contains(&f.id),
+            Msg::Click(f.id),
+        ));
     }
     if app.listing.dirs.is_empty() && app.listing.files.is_empty() {
         col = col.push(text("Nada apagado aqui.").size(13).color(p.muted));
@@ -250,7 +304,7 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
     let mut nodes = Vec::new();
     tree_nodes(app, "", 0, &mut nodes);
     let title = |s: &'static str| text(s).size(15).color(p.acc);
-    let left = column![title("Lixeira"), scrollable(column(nodes).spacing(1)).height(Length::Fill)]
+    let left = column![title("Lixeira"), scrollable(column(nodes).spacing(1).width(Length::Fill)).height(Length::Fill)]
         .spacing(6)
         .padding(8)
         .width(Length::Fixed(270.0));

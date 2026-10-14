@@ -76,14 +76,10 @@ pub fn flat_button(p: Pal, selected: bool) -> impl Fn(&Theme, button::Status) ->
     }
 }
 
-/// Tab of the ribbon bar. `accent` is the "Arquivo" tab.
-pub fn tab_button(p: Pal, active: bool, accent: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+/// Tab of the ribbon bar.
+pub fn tab_button(p: Pal, active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
     move |_, _| {
-        let (bg, fg) = match (accent, active) {
-            (true, _) => (p.acc, p.acc_fg),
-            (false, true) => (p.bg, p.fg),
-            (false, false) => (p.panel, p.fg),
-        };
+        let (bg, fg) = if active { (p.bg, p.fg) } else { (p.panel, p.fg) };
         button::Style {
             background: Some(Background::Color(bg)),
             text_color: fg,

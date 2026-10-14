@@ -2,7 +2,7 @@
 use iced::widget::{button, column, container, row, scrollable, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
-use super::home::{group, ribbon_button};
+use super::home::{cell, group, label, ribbon_bar, ribbon_button, row_button, ROW_H};
 use super::listing::split_masks;
 use super::theme;
 use super::{App, Msg};
@@ -39,45 +39,47 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
     let idle = !app.busy;
     let sel = app.folder_sel.is_some() && idle;
-    let mut actions = row![
-        ribbon_button(p, "create_new_folder", "Adicionar pasta", idle.then_some(Msg::AddFolder), false),
-        ribbon_button(p, "rule", "Editar regras", sel.then_some(Msg::EditRules), false),
-        ribbon_button(p, "folder_off", "Remover", sel.then_some(Msg::RemoveFolder), true),
-    ];
+    let mut groups = vec![group(
+        p,
+        row![
+            ribbon_button(p, "create_new_folder", "Adicionar pasta", idle.then_some(Msg::AddFolder), false),
+            ribbon_button(p, "rule", "Editar regras", sel.then_some(Msg::EditRules), false),
+            ribbon_button(p, "folder_off", "Remover", sel.then_some(Msg::RemoveFolder), true),
+        ]
+        .spacing(2),
+        "Pastas",
+    )];
     if app.confirm_remove {
-        actions = actions.push(
-            button(text("Confirmar remoção").size(12)).style(iced::widget::button::danger).on_press(Msg::ConfirmRemove),
-        );
+        groups.push(group(p, ribbon_button(p, "delete_forever", "Confirmar", Some(Msg::ConfirmRemove), true), "Remover a pasta?"));
     }
-    let ribbon = container(row![group(p, actions.align_y(Alignment::Center).into(), "Pastas")])
-        .width(Length::Fill)
-        .style(theme::surface(p, p.bg));
+    let ribbon = ribbon_bar(p, groups);
 
     let w = [Length::FillPortion(4), Length::FillPortion(3), Length::FillPortion(3), Length::Fixed(90.0)];
+    let head_cell = |s: &'static str, w: Length| cell(container(label(s, 12).color(p.muted)).center_y(Length::Fixed(ROW_H)), w);
     let head = row![
-        text("Pasta (com subpastas)").size(12).color(p.muted).width(w[0]),
-        text("Incluir").size(12).color(p.muted).width(w[1]),
-        text("Excluir").size(12).color(p.muted).width(w[2]),
-        text("Apagados").size(12).color(p.muted).width(w[3]),
+        head_cell("Pasta (com subpastas)", w[0]),
+        head_cell("Incluir", w[1]),
+        head_cell("Excluir", w[2]),
+        head_cell("Apagados", w[3]),
     ]
-    .padding([3, 6]);
-    let mut list = column![head].spacing(1);
+    .padding([0, 6])
+    .width(Length::Fill);
+    let mut list = column![head].spacing(1).width(Length::Fill);
     for (i, f) in app.folders.iter().enumerate() {
         let path = f.path.display().to_string();
-        list = list.push(
-            button(
-                row![
-                    row![super::icons::icon("folder_special", 17.0, p.acc), text(path.clone()).size(13)].spacing(6).width(w[0]),
-                    text(f.include.join("; ")).size(13).width(w[1]),
-                    text(if f.exclude.is_empty() { "nada".into() } else { f.exclude.join("; ") }).size(13).width(w[2]),
-                    text(app.tree.info(&path).count.to_string()).size(13).width(w[3]),
-                ]
-                .align_y(Alignment::Center),
-            )
-            .padding([3, 6])
-            .style(theme::flat_button(p, app.folder_sel == Some(i)))
-            .on_press(Msg::SelectFolder(i)),
-        );
+        let exclude = if f.exclude.is_empty() { "nada".into() } else { f.exclude.join("; ") };
+        list = list.push(row_button(
+            p,
+            row![
+                cell(row![super::icons::icon("folder_special", 17.0, p.acc), label(path.clone(), 13)].spacing(6), w[0]),
+                cell(label(f.include.join("; "), 13), w[1]),
+                cell(label(exclude, 13), w[2]),
+                cell(label(app.tree.info(&path).count.to_string(), 13), w[3]),
+            ]
+            .align_y(Alignment::Center),
+            app.folder_sel == Some(i),
+            Msg::SelectFolder(i),
+        ));
     }
     if app.folders.is_empty() {
         list = list.push(text("Nenhuma pasta protegida: nada vai para a lixeira.").size(13).color(p.muted));

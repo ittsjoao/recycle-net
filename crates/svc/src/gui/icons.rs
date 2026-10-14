@@ -16,7 +16,7 @@ pub const USED: &[&str] = &[
     "restore", "drive_file_move", "delete_forever", "history", "refresh", "search",
     "create_new_folder", "rule", "folder_off", "save", "install_desktop", "play_circle",
     "stop_circle", "delete", "folder_special", "folder", "folder_open", "description",
-    "arrow_upward", "check_circle", "error", "delete_sweep", "info", "logout",
+    "arrow_upward", "check_circle", "error", "info", "close",
 ];
 
 fn map() -> &'static HashMap<&'static str, char> {

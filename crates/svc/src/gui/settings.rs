@@ -1,10 +1,10 @@
-//! "Configurações" and "Arquivo" tabs.
+//! "Configurações" tab (settings, service controls, credits).
 use std::path::PathBuf;
 
-use iced::widget::{button, column, container, row, text, text_input, Space};
+use iced::widget::{button, column, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
-use super::theme;
+use super::home::{group, ribbon_bar, ribbon_button};
 use super::{App, Msg};
 use crate::config::{Config, FolderRule, ThemeName, CONFIG_PATH};
 use crate::install::SvcState;
@@ -73,24 +73,24 @@ impl Form {
 pub(super) fn view(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
     let idle = !app.busy;
-    let rb = super::home::ribbon_button;
     // Installing with no protected folder would start a service that guards nothing.
     let can_install = idle && app.svc == SvcState::NotInstalled && !app.folders.is_empty();
-    let ribbon = container(row![
-        super::home::group(p, rb(p, "save", "Salvar", idle.then_some(Msg::Save), false), " "),
-        super::home::group(
-            p,
-            row![
-                rb(p, "install_desktop", "Instalar", can_install.then_some(Msg::Install), false),
-                rb(p, "play_circle", "Iniciar", (idle && app.svc == SvcState::Stopped).then_some(Msg::Start), false),
-                rb(p, "stop_circle", "Parar", (idle && app.svc == SvcState::Running).then_some(Msg::Stop), true),
-            ]
-            .into(),
-            "Serviço",
-        ),
-    ])
-    .width(Length::Fill)
-    .style(theme::surface(p, p.bg));
+    let ribbon = ribbon_bar(
+        p,
+        vec![
+            group(p, ribbon_button(p, "save", "Salvar", idle.then_some(Msg::Save), false), "Configuração"),
+            group(
+                p,
+                row![
+                    ribbon_button(p, "install_desktop", "Instalar", can_install.then_some(Msg::Install), false),
+                    ribbon_button(p, "play_circle", "Iniciar", (idle && app.svc == SvcState::Stopped).then_some(Msg::Start), false),
+                    ribbon_button(p, "stop_circle", "Parar", (idle && app.svc == SvcState::Running).then_some(Msg::Stop), true),
+                ]
+                .spacing(2),
+                "Serviço",
+            ),
+        ],
+    );
 
     let field = |label: &'static str, hint: &'static str, value: &str, f: Field| {
         row![text(label).size(13).width(Length::Fixed(230.0)), text_input(hint, value).on_input(move |v| Msg::Field(f, v))]
@@ -132,27 +132,13 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
             .size(12)
             .color(p.muted),
             Space::new().height(Length::Fill),
+            text(format!("rnetrbin {} · Ícones: Material Icons, Google (Apache 2.0)", env!("CARGO_PKG_VERSION")))
+                .size(11)
+                .color(p.muted),
         ]
         .spacing(10)
         .padding(12),
     ]
-    .into()
-}
-
-pub(super) fn view_file(app: &App) -> Element<'_, Msg> {
-    let p = app.pal();
-    column![
-        row![super::icons::icon("info", 22.0, p.acc), text(format!("rnetrbin {}", env!("CARGO_PKG_VERSION"))).size(16)]
-            .spacing(8)
-            .align_y(Alignment::Center),
-        text("Lixeira de rede para compartilhamentos SMB, sobre o driver netrbin.sys.").size(13),
-        text("Ícones: Material Icons, Google (Apache 2.0).").size(12).color(p.muted),
-        button(row![super::icons::icon("logout", 18.0, p.danger), text("Sair").size(13)].spacing(6).align_y(Alignment::Center))
-            .style(theme::flat_button(p, false))
-            .on_press(Msg::Exit),
-    ]
-    .spacing(12)
-    .padding(16)
     .into()
 }
 

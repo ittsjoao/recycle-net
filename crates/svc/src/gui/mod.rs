@@ -1,5 +1,6 @@
 //! Desktop window (iced), Undelete style: ribbon tabs, bin tree, folder listing.
 mod folders;
+mod messages;
 mod home;
 mod settings;
 pub mod icons;
@@ -9,8 +10,9 @@ pub mod tree;
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use iced::widget::{column, container, row, text, Space};
+use iced::widget::{button, column, container, row, stack, text, Space};
 use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
 
 use crate::audit::setup::{self as audit_setup, AuditStatus};
@@ -35,7 +37,6 @@ pub fn run() -> iced::Result {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Tab {
-    Arquivo,
     Inicio,
     Pastas,
     Config,
@@ -75,9 +76,9 @@ pub enum Msg {
     Install,
     Start,
     Stop,
-    // Arquivo
-    Exit,
     Done(Result<String, String>),
+    /// Hide toast `id` (its timer ran out, or the user closed it).
+    ToastClose(u64),
 }
 
 pub struct App {
@@ -104,8 +105,38 @@ pub struct App {
     svc: SvcState,
     driver: SvcState,
     audit: AuditStatus,
-    status: String,
+    toast: Option<Toast>,
+    toast_seq: u64,
     busy: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    Ok,
+    Info,
+    Error,
+}
+
+/// Outcome message shown bottom-right over the content.
+struct Toast {
+    id: u64,
+    text: String,
+    kind: Kind,
+}
+
+/// Hide toast `id` after a few seconds (errors and hints stay longer). The
+/// wait happens on its own thread so no executor thread is held.
+fn expire(id: u64, kind: Kind) -> Task<Msg> {
+    let secs = if kind == Kind::Ok { 4 } else { 8 };
+    Task::future(async move {
+        let (tx, rx) = iced::futures::channel::oneshot::channel();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_secs(secs));
+            let _ = tx.send(());
+        });
+        let _ = rx.await;
+        Msg::ToastClose(id)
+    })
 }
 
 /// Run blocking work off the UI thread and report its outcome.
@@ -117,14 +148,17 @@ fn open_index(db: &Path) -> Result<Arc<Index>, String> {
     if let Some(parent) = db.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
-    Index::open(db).map(Arc::new).map_err(|e| format!("Não abriu o índice {}: {e}", db.display()))
+    Index::open(db).map(Arc::new).map_err(|_| {
+        format!("Não foi possível abrir o índice em {}; confira o caminho em Configurações.", db.display())
+    })
 }
 
-fn summary(verb: &str, n: usize, errs: Vec<String>) -> Result<String, String> {
-    if errs.is_empty() {
-        Ok(format!("{n} {verb}."))
-    } else {
-        Err(format!("{} de {n} falharam: {}", errs.len(), errs.join("; ")))
+/// `done` like "arquivo(s) restaurado(s)"; each error is already a sentence.
+fn summary(done: &str, n: usize, errs: Vec<String>) -> Result<String, String> {
+    match errs.len() {
+        0 => Ok(format!("{n} {done}.")),
+        1 if n == 1 => Err(errs.join("")),
+        k => Err(format!("{k} de {n} não deram certo. {}", errs.join(" "))),
     }
 }
 
@@ -154,24 +188,32 @@ impl App {
             svc: SvcState::NotInstalled,
             driver: SvcState::NotInstalled,
             audit: AuditStatus::default(),
-            status: String::new(),
+            toast: None,
+            toast_seq: 0,
             busy: false,
         };
         match Config::load(Path::new(CONFIG_PATH)) {
             Ok(c) => app.apply_config(&c),
-            Err(e) => {
-                app.status = if Path::new(CONFIG_PATH).exists() {
-                    format!("Configuração inválida ({e}); corrija em Configurações.")
-                } else {
-                    "Primeiro uso: adicione as pastas em Pastas protegidas e instale em Configurações.".into()
-                };
+            Err(e) if Path::new(CONFIG_PATH).exists() => {
+                app.notify(format!("{} Corrija em Configurações.", messages::config(&e)), Kind::Error)
             }
+            Err(_) => app.notify(
+                "Primeiro uso: adicione as pastas em Pastas protegidas e instale em Configurações.",
+                Kind::Info,
+            ),
         }
         app.refresh();
         if app.svc == SvcState::NotInstalled {
             app.tab = Tab::Config;
         }
-        (app, Task::none())
+        let task = app.toast.as_ref().map_or_else(Task::none, |t| expire(t.id, t.kind));
+        (app, task)
+    }
+
+    /// Show a toast; `update` schedules its expiry.
+    fn notify(&mut self, text: impl Into<String>, kind: Kind) {
+        self.toast_seq += 1;
+        self.toast = Some(Toast { id: self.toast_seq, text: text.into(), kind });
     }
 
     fn title(&self) -> String {
@@ -200,7 +242,7 @@ impl App {
         self.folders = c.folders.clone();
         match open_index(&c.db_path) {
             Ok(i) => self.idx = Some(i),
-            Err(e) => self.status = e,
+            Err(e) => self.notify(e, Kind::Error),
         }
     }
 
@@ -212,7 +254,7 @@ impl App {
         if let Some(idx) = &self.idx {
             match idx.all_versions() {
                 Ok(v) => self.rows = v,
-                Err(e) => self.status = format!("Erro ao ler o índice: {e}"),
+                Err(_) => self.notify("Não foi possível ler o índice; tente Atualizar.", Kind::Error),
             }
         }
         let roots: Vec<String> = self.folders.iter().map(|f| f.path.display().to_string()).collect();
@@ -288,29 +330,33 @@ impl App {
     }
 
     /// Validate and write the config; restart the service if it is running.
-    /// None = nothing was written (the reason is in `status`).
+    /// None = nothing was written (the reason is in the toast).
     fn save_config(&mut self) -> Option<Task<Msg>> {
         let mut cfg = match self.form.to_config(&self.folders, self.theme) {
             Ok(c) => c,
             Err(e) => {
-                self.status = e;
+                self.notify(format!("{e}."), Kind::Error);
                 return None;
             }
         };
         if let Err(e) = cfg.save(Path::new(CONFIG_PATH)) {
-            self.status = format!("Não salvou: {e}");
+            self.notify(format!("Não salvou. {}", messages::config(&e)), Kind::Error);
             return None;
         }
+        let seq = self.toast_seq;
         self.apply_config(&cfg);
         if self.svc != SvcState::Running {
-            self.status = "Configuração salva.".into();
+            // Keep an index error from apply_config visible instead.
+            if self.toast_seq == seq {
+                self.notify("Configuração salva.", Kind::Ok);
+            }
             self.refresh();
             return Some(Task::none());
         }
         self.busy = true;
         Some(work(|| {
-            install::stop_own_service()?;
-            install::start_service(install::OWN_SERVICE)?;
+            install::stop_own_service().map_err(|e| messages::service(&e))?;
+            install::start_service(install::OWN_SERVICE).map_err(|e| messages::service(&e))?;
             Ok("Configuração salva; serviço reiniciado.".into())
         }))
     }
@@ -325,24 +371,32 @@ impl App {
                 let dest = dir.as_ref().map(|d| d.join(listing::split_path(&v.original_path).0));
                 let r = match &dest {
                     // restore() with an override copies over the target; never clobber here.
-                    Some(d) if d.exists() => Err(format!("{} já existe", d.display())),
-                    _ => crate::restore::restore(&idx, v.id, dest.as_deref()).map(|_| ()).map_err(|e| match e {
-                        crate::restore::RestoreError::Exists => {
-                            format!("{} já existe no local original; use \"Restaurar em...\"", v.original_path)
-                        }
-                        e => format!("{}: {e}", v.original_path),
-                    }),
+                    Some(d) if d.exists() => {
+                        Err(format!("Já existe {} na pasta escolhida; nada foi sobrescrito.", d.display()))
+                    }
+                    _ => crate::restore::restore(&idx, v.id, dest.as_deref())
+                        .map(|_| ())
+                        .map_err(|e| messages::restore(&e, &v.original_path)),
                 };
                 if let Err(e) = r {
                     errs.push(e);
                 }
             }
-            summary("restaurado(s)", items.len(), errs)
+            summary("arquivo(s) restaurado(s)", items.len(), errs)
         })
     }
 
     fn update(&mut self, msg: Msg) -> Task<Msg> {
-        if !matches!(msg, Msg::ConfirmRemove | Msg::Modifiers(_)) {
+        let seq = self.toast_seq;
+        let task = self.handle(msg);
+        match &self.toast {
+            Some(t) if self.toast_seq != seq => Task::batch([task, expire(t.id, t.kind)]),
+            _ => task,
+        }
+    }
+
+    fn handle(&mut self, msg: Msg) -> Task<Msg> {
+        if !matches!(msg, Msg::ConfirmRemove | Msg::Modifiers(_) | Msg::ToastClose(_)) {
             self.confirm_remove = false;
         }
         match msg {
@@ -392,19 +446,21 @@ impl App {
             }
             Msg::Purge => {
                 let Some(idx) = self.idx.clone() else { return Task::none() };
-                let ids: Vec<i64> = self.selected.iter().copied().collect();
+                let items = self.selected_versions();
                 self.busy = true;
                 return work(move || {
-                    let errs: Vec<String> = ids
+                    let errs: Vec<String> = items
                         .iter()
-                        .filter_map(|id| crate::retention::purge(&idx, *id).err().map(|e| format!("#{id}: {e}")))
+                        .filter_map(|v| {
+                            crate::retention::purge(&idx, v.id).err().map(|e| messages::purge(&e, &v.original_path))
+                        })
                         .collect();
-                    summary("excluído(s) de vez", ids.len(), errs)
+                    summary("arquivo(s) excluído(s) de vez", items.len(), errs)
                 });
             }
             Msg::Refresh => {
                 self.refresh();
-                self.status = "Lista atualizada.".into();
+                self.notify("Lista atualizada.", Kind::Ok);
             }
             Msg::SelectFolder(i) => self.folder_sel = Some(i),
             Msg::AddFolder => {
@@ -435,7 +491,7 @@ impl App {
                 let Some(edit) = self.rule_edit.take() else { return Task::none() };
                 let before = self.folders.clone();
                 if let Err(e) = folders::apply_rule(&mut self.folders, edit.index, edit.to_rule()) {
-                    self.status = e;
+                    self.notify(e, Kind::Error);
                     return Task::none();
                 }
                 match self.save_config() {
@@ -474,28 +530,41 @@ impl App {
                 }
                 self.busy = true;
                 return work(|| {
-                    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
-                    install::install(&install::WinHost, install::EMBEDDED_DRIVER, &exe).map_err(|e| e.to_string())?;
-                    install::start_service(install::OWN_SERVICE)?;
+                    let exe = std::env::current_exe().map_err(|e| {
+                        format!("Não foi possível localizar o executável: {}.", messages::clean(&e.to_string()))
+                    })?;
+                    install::install(&install::WinHost, install::EMBEDDED_DRIVER, &exe)
+                        .map_err(|e| messages::install(&e))?;
+                    install::start_service(install::OWN_SERVICE).map_err(|e| messages::service(&e))?;
                     Ok(format!("Instalado e iniciado. O serviço usa {}; não mova este arquivo.", exe.display()))
                 });
             }
             Msg::Start => {
                 self.busy = true;
-                return work(|| install::start_service(install::OWN_SERVICE).map(|_| "Serviço iniciado.".into()));
+                return work(|| {
+                    install::start_service(install::OWN_SERVICE)
+                        .map(|_| "Serviço iniciado.".into())
+                        .map_err(|e| messages::service(&e))
+                });
             }
             Msg::Stop => {
                 self.busy = true;
-                return work(|| install::stop_own_service().map(|_| "Serviço parado.".into()));
+                return work(|| {
+                    install::stop_own_service().map(|_| "Serviço parado.".into()).map_err(|e| messages::service(&e))
+                });
             }
-            Msg::Exit => return iced::exit(),
             Msg::Done(r) => {
                 self.busy = false;
-                self.status = match r {
-                    Ok(s) => s,
-                    Err(e) => format!("Erro: {e}"),
-                };
+                match r {
+                    Ok(s) => self.notify(s, Kind::Ok),
+                    Err(e) => self.notify(e, Kind::Error),
+                }
                 self.refresh();
+            }
+            Msg::ToastClose(id) => {
+                if self.toast.as_ref().is_some_and(|t| t.id == id) {
+                    self.toast = None;
+                }
             }
         }
         Task::none()
@@ -504,13 +573,12 @@ impl App {
     fn view(&self) -> Element<'_, Msg> {
         let p = self.pal();
         let tab = |label: &'static str, t: Tab| {
-            iced::widget::button(text(label).size(13))
+            button(text(label).size(13).wrapping(text::Wrapping::None))
                 .padding([5, 14])
-                .style(theme::tab_button(p, self.tab == t, t == Tab::Arquivo))
+                .style(theme::tab_button(p, self.tab == t))
                 .on_press(Msg::Tab(t))
         };
         let tabs = container(row![
-            tab("Arquivo", Tab::Arquivo),
             tab("Início", Tab::Inicio),
             tab("Pastas protegidas", Tab::Pastas),
             tab("Configurações", Tab::Config),
@@ -518,16 +586,60 @@ impl App {
         .width(Length::Fill)
         .style(theme::surface(p, p.panel));
         let body = match self.tab {
-            Tab::Arquivo => settings::view_file(self),
             Tab::Inicio => home::view(self),
             Tab::Pastas => folders::view(self),
             Tab::Config => settings::view(self),
         };
-        container(column![tabs, container(body).height(Length::Fill), self.status_bar()])
+        let main = container(column![tabs, container(body).height(Length::Fill), self.status_bar()])
             .width(Length::Fill)
             .height(Length::Fill)
-            .style(theme::surface(p, p.bg))
-            .into()
+            .style(theme::surface(p, p.bg));
+        match &self.toast {
+            None => main.into(),
+            Some(t) => stack![
+                main,
+                container(self.toast_box(t))
+                    .align_right(Length::Fill)
+                    .align_bottom(Length::Fill)
+                    .padding(iced::Padding { top: 0.0, right: 14.0, bottom: 38.0, left: 0.0 }),
+            ]
+            .into(),
+        }
+    }
+
+    fn toast_box<'a>(&self, t: &'a Toast) -> Element<'a, Msg> {
+        let p = self.pal();
+        let (icon, color) = match t.kind {
+            Kind::Ok => ("check_circle", p.ok),
+            Kind::Info => ("info", p.acc),
+            Kind::Error => ("error", p.danger),
+        };
+        container(
+            row![
+                icons::icon(icon, 20.0, color),
+                text(t.text.as_str()).size(13).width(Length::Fill),
+                button(icons::icon("close", 16.0, p.muted))
+                    .padding(2)
+                    .style(theme::flat_button(p, false))
+                    .on_press(Msg::ToastClose(t.id)),
+            ]
+            .spacing(10)
+            .align_y(Alignment::Center),
+        )
+        .padding([10, 12])
+        .width(Length::Fixed(420.0))
+        .style(move |_| container::Style {
+            background: Some(iced::Background::Color(p.panel)),
+            text_color: Some(p.fg),
+            border: iced::Border { color, width: 1.0, radius: 4.0.into() },
+            shadow: iced::Shadow {
+                color: iced::Color { a: 0.25, ..iced::Color::BLACK },
+                offset: iced::Vector::new(0.0, 2.0),
+                blur_radius: 8.0,
+            },
+            ..Default::default()
+        })
+        .into()
     }
 
     fn status_bar(&self) -> Element<'_, Msg> {
@@ -548,7 +660,6 @@ impl App {
         };
         let used = self.tree.info("").size;
         let limit = self.form.max_gb.replace(',', ".").parse::<f64>().unwrap_or(0.0);
-        let msg = if self.busy { "Trabalhando..." } else { self.status.as_str() };
         container(
             row![
                 state("Serviço", self.svc == SvcState::Running, svc_word),
@@ -557,7 +668,7 @@ impl App {
                 text(format!("Lixeira: {} de {limit} GB", listing::fmt_size(used))).size(12),
                 text(format!("{} selecionado(s)", self.selected.len())).size(12),
                 Space::new().width(Length::Fill),
-                text(msg.to_string()).size(12),
+                text(if self.busy { "Trabalhando..." } else { "" }).size(12),
             ]
             .spacing(18)
             .align_y(Alignment::Center),
