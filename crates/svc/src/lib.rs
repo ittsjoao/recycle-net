@@ -4,3 +4,4 @@ pub mod config;
 pub mod index;
 pub mod finalize;
 pub mod watcher;
+pub mod retention;
