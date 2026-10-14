@@ -22,19 +22,6 @@ pub fn build_buffers(command: i32, payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
     (command.to_le_bytes().to_vec(), payload.to_vec())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    #[test]
-    fn command_in_inbuffer_payload_in_outbuffer() {
-        let (i, o) = build_buffers(3, &[9, 8, 7]);
-        assert_eq!(i, 3i32.to_le_bytes().to_vec());
-        assert_eq!(o, vec![9, 8, 7]);
-        let (i, o) = build_buffers(2, &[]);
-        assert_eq!(i, vec![2, 0, 0, 0]);
-        assert!(o.is_empty());
-    }
-}
 
 const PORT_NAME: &str = r"\CaptureFileMonitorPort";
 
@@ -81,5 +68,19 @@ impl PortClient {
 impl Drop for PortClient {
     fn drop(&mut self) {
         unsafe { let _ = CloseHandle(self.handle); }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn command_in_inbuffer_payload_in_outbuffer() {
+        let (i, o) = build_buffers(3, &[9, 8, 7]);
+        assert_eq!(i, 3i32.to_le_bytes().to_vec());
+        assert_eq!(o, vec![9, 8, 7]);
+        let (i, o) = build_buffers(2, &[]);
+        assert_eq!(i, vec![2, 0, 0, 0]);
+        assert!(o.is_empty());
     }
 }
