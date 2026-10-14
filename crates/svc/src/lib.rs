@@ -6,3 +6,4 @@ pub mod finalize;
 pub mod watcher;
 pub mod retention;
 pub mod restore;
+pub mod service;

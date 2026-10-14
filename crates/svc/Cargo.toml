@@ -21,6 +21,7 @@ toml = "0.8"
 rusqlite = { version = "0.31", features = ["bundled"] }
 notify = "6"
 windows-service = "0.7"
+ctrlc = "3"
 
 [dependencies.windows]
 version = "0.58"
