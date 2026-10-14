@@ -7,6 +7,11 @@ pub struct DeletedFile {
     pub size: i64, pub deleted_utc: i64,
     pub user_sid: Option<String>, pub user_name: Option<String>,
 }
+/// A non-restored backup as listed in the GUI.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Entry {
+    pub id: i64, pub original_path: String, pub size: i64, pub deleted_utc: i64,
+}
 /// Thread-safe: the single SQLite connection is guarded by a Mutex.
 pub struct Index { conn: Mutex<Connection> }
 
@@ -27,6 +32,8 @@ impl Index {
     }
     pub fn open(path: &Path) -> rusqlite::Result<Index> {
         let conn = Connection::open(path)?;
+        // The service and the GUI open the same db; wait out the other's writes.
+        conn.busy_timeout(std::time::Duration::from_secs(10))?;
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.execute_batch(SCHEMA)?;
         Ok(Index { conn: Mutex::new(conn) })
@@ -116,6 +123,23 @@ impl Index {
     pub fn deleted_utc(&self, id: i64) -> rusqlite::Result<i64> {
         self.c().query_row("SELECT deleted_utc FROM deleted_files WHERE id=?1", [id], |r| r.get(0))
     }
+    /// Non-restored rows whose original path contains `search` (case-insensitive),
+    /// newest first, at most `limit`; plus the total number of matches.
+    pub fn search_unrestored(&self, search: &str, limit: usize) -> rusqlite::Result<(Vec<Entry>, i64)> {
+        let pat = format!("%{}%", search.replace('\\', "\\\\").replace('%', "\\%").replace('_', "\\_"));
+        let conn = self.c();
+        let total = conn.query_row(
+            "SELECT COUNT(*) FROM deleted_files WHERE is_restored=0 AND original_path LIKE ?1 ESCAPE '\\'",
+            [&pat], |r| r.get(0))?;
+        let mut st = conn.prepare(
+            "SELECT id,original_path,size,deleted_utc FROM deleted_files
+             WHERE is_restored=0 AND original_path LIKE ?1 ESCAPE '\\'
+             ORDER BY deleted_utc DESC, id DESC LIMIT ?2")?;
+        let rows = st.query_map(params![pat, limit as i64], |r| Ok(Entry {
+            id: r.get(0)?, original_path: r.get(1)?, size: r.get(2)?, deleted_utc: r.get(3)?,
+        }))?;
+        Ok((rows.collect::<rusqlite::Result<_>>()?, total))
+    }
     pub fn count_by_backup_path(&self, backup_path: &str) -> rusqlite::Result<i64> {
         self.c().query_row("SELECT COUNT(*) FROM deleted_files WHERE backup_path=?1",
             [backup_path], |r| r.get(0))
@@ -165,6 +189,23 @@ mod tests {
         idx.insert(&sample(1, 100)).unwrap();
         idx.insert(&sample(2, 50)).unwrap();
         assert_eq!(idx.total_size().unwrap(), 150);
+    }
+    #[test]
+    fn search_is_substring_newest_first_and_literal() {
+        let idx = Index::open_memory().unwrap();
+        idx.insert(&sample(1, 1)).unwrap();
+        let id2 = idx.insert(&sample(2, 1)).unwrap();
+        let id3 = idx.insert(&sample(3, 1)).unwrap();
+        let mut f = sample(4, 1);
+        f.original_path = "D:\\x\\100%_done.txt".into();
+        let id4 = idx.insert(&f).unwrap();
+        idx.mark_restored(id3).unwrap();
+        let (rows, total) = idx.search_unrestored("", 2).unwrap();
+        assert_eq!(total, 3);
+        assert_eq!(rows.iter().map(|e| e.id).collect::<Vec<_>>(), [id4, id2]);
+        let (rows, total) = idx.search_unrestored("d:\\A\\2", 10).unwrap();
+        assert_eq!((rows.len(), total), (1, 1));
+        assert_eq!(idx.search_unrestored("%_", 10).unwrap().1, 1);
     }
     #[test]
     fn oldest_first_and_excludes_restored() {

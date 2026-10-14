@@ -22,6 +22,10 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 notify = "6"
 windows-service = "0.7"
 ctrlc = "3"
+# wgpu with tiny-skia software fallback: renders over RDP without a GPU.
+iced = { version = "0.14", default-features = false, features = ["wgpu", "tiny-skia", "thread-pool", "crisp"] }
+rfd = { version = "0.17.2", default-features = false }
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
 
 [dependencies.windows]
 version = "0.58"
@@ -32,6 +36,10 @@ features = [
   "Win32_Security",
   "Win32_System_Registry",
   "Win32_Storage_FileSystem",
+  "Win32_System_Console",
+  "Win32_System_Threading",
+  "Win32_UI_Shell",
+  "Win32_UI_WindowsAndMessaging",
 ]
 
 [dev-dependencies]

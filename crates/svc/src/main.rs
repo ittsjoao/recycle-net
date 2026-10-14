@@ -4,7 +4,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rnetrbin_svc::{config::Config, install, service};
+use rnetrbin_svc::config::{Config, CONFIG_PATH};
+use rnetrbin_svc::{install, service};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
@@ -12,7 +13,6 @@ use windows_service::service_control_handler::{self, ServiceControlHandlerResult
 use windows_service::{define_windows_service, service_dispatcher};
 
 const SERVICE_NAME: &str = "rnetrbin-svc";
-const CONFIG_PATH: &str = r"C:\ProgramData\rnetrbin\config.toml";
 const LOG_PATH: &str = r"C:\ProgramData\rnetrbin\rnetrbin-svc.log";
 
 define_windows_service!(ffi_service_main, service_main);
@@ -137,18 +137,21 @@ fn run_console(takeover: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `install --driver <netrbin.sys>`: the config must already be valid, so the
-/// service never starts against a config it would reject.
+/// `install [--driver <netrbin.sys>]`: installs the embedded driver unless
+/// overridden. The config must already be valid, so the service never starts
+/// against a config it would reject.
 fn run_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
-    let driver = args
-        .iter()
-        .position(|a| a == "--driver")
-        .and_then(|i| args.get(i + 1))
-        .ok_or("usage: rnetrbin-svc install --driver <path\\to\\netrbin.sys>")?;
+    let driver = match args.iter().position(|a| a == "--driver") {
+        Some(i) => {
+            let p = args.get(i + 1).ok_or("usage: rnetrbin-svc install [--driver <path\\to\\netrbin.sys>]")?;
+            Some(install::read_driver_override(Path::new(p))?)
+        }
+        None => None,
+    };
     Config::load(Path::new(CONFIG_PATH)).map_err(|e| format!("config {CONFIG_PATH}: {e}"))?;
     let exe = std::env::current_exe()?;
-    install::install(&install::WinHost, Path::new(driver), &exe)?;
+    install::install(&install::WinHost, driver.as_deref().unwrap_or(install::EMBEDDED_DRIVER), &exe)?;
     println!("installed; start with: sc.exe start {SERVICE_NAME}");
     Ok(())
 }
@@ -164,8 +167,82 @@ fn run_uninstall(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Console exe (so CLI output and exit codes work in cmd/PowerShell): when
+/// opened by double click the console exists only for us, so drop it.
+fn detach_own_console() {
+    use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
+    let mut ids = [0u32; 2];
+    if unsafe { GetConsoleProcessList(&mut ids) } == 1 {
+        let _ = unsafe { FreeConsole() };
+    }
+}
+
+fn is_elevated() -> bool {
+    use windows::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows::Win32::Security::{GetTokenInformation, TokenElevation, TOKEN_ELEVATION, TOKEN_QUERY};
+    use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+    let mut token = HANDLE::default();
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) }.is_err() {
+        return false;
+    }
+    let mut el = TOKEN_ELEVATION::default();
+    let mut len = 0u32;
+    let ok = unsafe {
+        GetTokenInformation(
+            token,
+            TokenElevation,
+            Some(&mut el as *mut _ as *mut _),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut len,
+        )
+    }
+    .is_ok();
+    unsafe {
+        let _ = CloseHandle(token);
+    }
+    ok && el.TokenIsElevated != 0
+}
+
+/// Relaunch this exe through UAC; Ok(false) if the user declined.
+fn relaunch_elevated() -> Result<bool, Box<dyn std::error::Error>> {
+    use windows::core::{w, PCWSTR};
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+    let exe = widestring::U16CString::from_os_str(std::env::current_exe()?)?;
+    let h = unsafe { ShellExecuteW(None, w!("runas"), PCWSTR(exe.as_ptr()), None, None, SW_SHOWNORMAL) };
+    // ShellExecute reports success as a pseudo-handle value > 32.
+    Ok(h.0 as isize > 32)
+}
+
+fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
+    detach_own_console();
+    if !is_elevated() {
+        relaunch_elevated()?;
+        return Ok(());
+    }
+    rnetrbin_svc::gui::run()?;
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some(install::SERVICE_ARG) {
+        if let Err(e) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
+            init_file_logging();
+            tracing::error!("service dispatcher failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
+    let cli = matches!(args.get(1).map(String::as_str), Some("install" | "uninstall" | "--console"));
+    if !cli {
+        if let Err(e) = run_gui() {
+            init_file_logging();
+            tracing::error!("gui failed: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     let sub = match args.get(1).map(String::as_str) {
         Some("install") => Some(run_install(&args)),
         Some("uninstall") => Some(run_uninstall(&args)),
@@ -178,16 +255,9 @@ fn main() {
         }
         return;
     }
-    if args.iter().any(|a| a == "--console") {
-        let takeover = args.iter().any(|a| a == "--takeover");
-        if let Err(e) = run_console(takeover) {
-            eprintln!("error: {e}");
-            std::process::exit(1);
-        }
-        return;
-    }
-    if let Err(e) = service_dispatcher::start(SERVICE_NAME, ffi_service_main) {
-        eprintln!("service dispatcher failed (use --console to run interactively): {e}");
+    let takeover = args.iter().any(|a| a == "--takeover");
+    if let Err(e) = run_console(takeover) {
+        eprintln!("error: {e}");
         std::process::exit(1);
     }
 }

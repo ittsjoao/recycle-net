@@ -57,8 +57,50 @@ pub fn enforce(idx: &Index, max_bin_bytes: u64, max_age_days: Option<u32>) -> Re
     enforce_at(idx, max_bin_bytes, max_age_days, now)
 }
 
+/// Permanently delete one backup (file, then row). A locked file is an error
+/// and the row stays, so nothing is lost from the index.
+pub fn purge(idx: &Index, id: i64) -> Result<(), RetentionError> {
+    let (_, backup_path) = idx.conn_row(id)?;
+    match std::fs::remove_file(&backup_path) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e.into()),
+    }
+    idx.delete_row(id)?;
+    Ok(())
+}
+
+/// Empty the bin: purge every non-restored backup; locked files are skipped.
+/// Returns (purged, skipped).
+pub fn purge_all(idx: &Index) -> Result<(u64, u64), RetentionError> {
+    let (mut purged, mut skipped) = (0, 0);
+    for (id, backup_path, _) in idx.oldest_unrestored(usize::MAX >> 1)? {
+        if remove_backup(&backup_path) {
+            idx.delete_row(id)?;
+            purged += 1;
+        } else {
+            skipped += 1;
+        }
+    }
+    Ok((purged, skipped))
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn purge_removes_file_and_row_and_purge_all_empties() {
+        let dir = tempfile::tempdir().unwrap();
+        let idx = Index::open_memory().unwrap();
+        let a = add(&idx, dir.path(), 1);
+        add(&idx, dir.path(), 2);
+        add(&idx, dir.path(), 3);
+        purge(&idx, a).unwrap();
+        assert!(!dir.path().join("1.bin").exists());
+        assert!(idx.conn_row(a).is_err());
+        assert_eq!(purge_all(&idx).unwrap(), (2, 0));
+        assert_eq!(idx.total_size().unwrap(), 0);
+        assert!(!dir.path().join("3.bin").exists());
+    }
     use super::*;
     use std::fs;
     fn add(idx: &Index, dir: &std::path::Path, i: i64) -> i64 {
