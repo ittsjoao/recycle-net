@@ -82,6 +82,10 @@ pub trait Scm {
     fn disable_original(&self) -> Result<(), String>;
     /// Handback: set the start type (None = leave unchanged) and start the original.
     fn restore_start(&self, start_type: Option<u32>) -> Result<(), String>;
+    /// Configure SCM failure actions on OUR OWN service so a crash after takeover
+    /// auto-restarts us (a crash is the one case that leaves no protector until
+    /// the installer's recovery kicks in). Best-effort: a failure is logged.
+    fn ensure_self_recovery(&self) -> Result<(), String>;
 }
 
 /// The driver communication-port session.
@@ -314,6 +318,11 @@ pub fn takeover<S: Scm, T: StateStore, D: Driver>(
         match outcome {
             Outcome::Connected => {
                 tracing::info!("driver port connected and configured");
+                // Make ourselves auto-restart BEFORE we disable the original, so
+                // a crash in the protected window brings us back.
+                if let Err(e) = scm.ensure_self_recovery() {
+                    tracing::warn!("could not set self-recovery failure actions: {e}");
+                }
                 disable_with_state(scm, store);
                 return true;
             }
@@ -489,6 +498,9 @@ impl Scm for NoScm {
         Ok(())
     }
     fn restore_start(&self, _start_type: Option<u32>) -> Result<(), String> {
+        Ok(())
+    }
+    fn ensure_self_recovery(&self) -> Result<(), String> {
         Ok(())
     }
 }
@@ -668,6 +680,38 @@ impl Scm for WinScm {
         use windows::Win32::System::Services::*;
         Self::change_start(SERVICE_CHANGE_CONFIG | SERVICE_START, start_type, true)
     }
+
+    fn ensure_self_recovery(&self) -> Result<(), String> {
+        use windows::core::w;
+        use windows::Win32::System::Services::*;
+        unsafe {
+            let scm = OpenSCManagerW(None, None, SC_MANAGER_CONNECT).map_err(|e| format!("open SCM: {e}"))?;
+            let svc = OpenServiceW(scm, w!("rnetrbin-svc"), SERVICE_CHANGE_CONFIG)
+                .map_err(|e| format!("open self: {e}"))?;
+            // Restart after 60s on each of the first failures; reset the count daily.
+            let mut actions = [
+                SC_ACTION { Type: SC_ACTION_RESTART, Delay: 60_000 },
+                SC_ACTION { Type: SC_ACTION_RESTART, Delay: 60_000 },
+                SC_ACTION { Type: SC_ACTION_RESTART, Delay: 60_000 },
+            ];
+            let fa = SERVICE_FAILURE_ACTIONSW {
+                dwResetPeriod: 86_400,
+                lpRebootMsg: windows::core::PWSTR::null(),
+                lpCommand: windows::core::PWSTR::null(),
+                cActions: actions.len() as u32,
+                lpsaActions: actions.as_mut_ptr(),
+            };
+            let res = ChangeServiceConfig2W(
+                svc,
+                SERVICE_CONFIG_FAILURE_ACTIONS,
+                Some(&fa as *const _ as *const _),
+            )
+            .map_err(|e| format!("set failure actions: {e}"));
+            let _ = CloseServiceHandle(svc);
+            let _ = CloseServiceHandle(scm);
+            res
+        }
+    }
 }
 
 #[cfg(test)]
@@ -714,6 +758,10 @@ mod tests {
         fn disable_original(&self) -> Result<(), String> {
             self.log("disable");
             self.start_type.set(START_DISABLED);
+            Ok(())
+        }
+        fn ensure_self_recovery(&self) -> Result<(), String> {
+            self.log("self_recovery");
             Ok(())
         }
         fn restore_start(&self, start_type: Option<u32>) -> Result<(), String> {
@@ -862,7 +910,7 @@ mod tests {
         assert!(takeover(&w, &w, &mut drv, &stop, &mut 0, &|_| {}));
         assert_eq!(
             w.calls(),
-            vec!["stop", "configure", "configure", "configure", "query", "write_state", "disable"]
+            vec!["stop", "configure", "configure", "configure", "self_recovery", "query", "write_state", "disable"]
         );
         assert_eq!(w.read(), Marker::Saved(2));
     }
@@ -1143,6 +1191,7 @@ mod tests_round3 {
         fn query_start_type(&self) -> Result<Option<u32>, String> { Ok(Some(2)) }
         fn disable_original(&self) -> Result<(), String> { self.log("disable"); Ok(()) }
         fn restore_start(&self, _t: Option<u32>) -> Result<(), String> { self.log("restore"); Ok(()) }
+        fn ensure_self_recovery(&self) -> Result<(), String> { Ok(()) }
     }
     impl StateStore for W {
         fn read(&self) -> Marker { *self.marker.borrow() }
