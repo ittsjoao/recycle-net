@@ -29,6 +29,17 @@ impl Config {
         if self.includes.is_empty() {
             return Err(ConfigError::Invalid("includes must not be empty".into()));
         }
+        if !self.recycle_dir.is_absolute() {
+            return Err(ConfigError::Invalid("recycle_dir must be an absolute path".into()));
+        }
+        if self.max_bin_bytes == 0 {
+            return Err(ConfigError::Invalid("max_bin_bytes must be > 0".into()));
+        }
+        // The driver would capture the service's own db/deletes if the db lived in the recycle dir.
+        let lower = |p: &Path| PathBuf::from(p.to_string_lossy().to_lowercase());
+        if lower(&self.db_path).starts_with(lower(&self.recycle_dir)) {
+            return Err(ConfigError::Invalid("db_path must not be inside recycle_dir".into()));
+        }
         Ok(())
     }
 }
@@ -52,8 +63,29 @@ max_bin_bytes = 10737418240
     }
     #[test]
     fn empty_includes_is_invalid() {
-        let c = Config { recycle_dir: "D:\\x".into(), db_path: "D:\\x\\i.db".into(),
-            includes: vec![], excludes: vec![], max_bin_bytes: 1, max_age_days: None };
+        let mut c = ok_cfg();
+        c.includes = vec![];
+        assert!(c.validate().is_err());
+    }
+    fn ok_cfg() -> Config {
+        Config { recycle_dir: "D:\\x".into(), db_path: "D:\\db\\i.db".into(),
+            includes: vec!["*.*".into()], excludes: vec![], max_bin_bytes: 1, max_age_days: None }
+    }
+    #[test]
+    fn valid_config_passes() { assert!(ok_cfg().validate().is_ok()); }
+    #[test]
+    fn relative_recycle_dir_invalid() {
+        let mut c = ok_cfg(); c.recycle_dir = "rel\\x".into();
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn zero_quota_invalid() {
+        let mut c = ok_cfg(); c.max_bin_bytes = 0;
+        assert!(c.validate().is_err());
+    }
+    #[test]
+    fn db_inside_recycle_dir_invalid() {
+        let mut c = ok_cfg(); c.db_path = "d:\\X\\sub\\i.db".into();
         assert!(c.validate().is_err());
     }
 }

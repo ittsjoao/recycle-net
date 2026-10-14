@@ -27,3 +27,11 @@ On a VM only (never a production workstation): run the original service under Pr
 port trace, delete a file on a monitored volume, and capture the exact FilterSendMessage buffers and the
 files produced in the recycle dir (`.nrbnew` plus flag). Record results here. If the payload turns out
 to be in InBuffer, swap the buffer arguments in `PortClient::send` (public API unchanged).
+
+## Path model assumption (PENDING VM confirmation)
+
+The service assumes the driver mirrors the volume-relative path under the recycle root as
+`<recycle_root>\<DriveLetter>\<rest of path>` (e.g. `D:\data\a.txt` -> `<root>\D\data\a.txt.nrbnew`).
+`finalize::derive_original` maps this to volume `D:` and original path `D:\data\a.txt`. If the real layout differs,
+only `derive_original` needs to change. Final backups get a counter before the extension on name collision
+(`a.1.txt`); the original path recorded never contains that suffix.
