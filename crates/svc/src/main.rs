@@ -164,6 +164,9 @@ fn run_uninstall(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         install::Uninstalled::DriverRemoved => println!("service and netrbin driver removed"),
         install::Uninstalled::RebootRequired => println!("service removed; reboot to finish removing the driver"),
     }
+    if let Err(e) = rnetrbin_svc::audit::setup::undo() {
+        eprintln!("warning: could not undo audit settings: {e}");
+    }
     Ok(())
 }
 
