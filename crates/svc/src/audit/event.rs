@@ -28,6 +28,10 @@ fn time_created(xml: &str) -> Option<String> {
     let rest = &xml[xml.find("<TimeCreated")?..];
     let rest = &rest[rest.find("SystemTime=")? + "SystemTime=".len()..];
     let q = rest.chars().next()?;
+    // Only accept ' or " as quotes to prevent panic on multi-byte chars at char boundary
+    if q != '\'' && q != '"' {
+        return None;
+    }
     let rest = &rest[1..];
     Some(rest[..rest.find(q)?].to_string())
 }
@@ -94,5 +98,23 @@ mod tests {
         assert!(parse_4663(&sample("File", "0x2", "D:\\a.txt")).is_none());
         assert!(parse_4663(&sample("File", "0x10000", "D:\\a.txt").replace("4663", "4660")).is_none());
         assert!(parse_4663("<Event/>").is_none());
+    }
+
+    #[test]
+    fn rejects_malformed_systemtime_with_non_ascii_quote() {
+        // Regression test: non-ASCII char after SystemTime= should not panic
+        // Instead, parse_4663 should return None
+        let xml = sample("File", "0x10000", "D:\\a.txt").replace("SystemTime='", "SystemTime=é");
+        assert!(parse_4663(&xml).is_none());
+    }
+
+    #[test]
+    fn rejects_missing_subject_user_name() {
+        // Per spec §6 (XML incompleto): event with AccessMask 0x10000 but missing SubjectUserName returns None
+        let mut xml = sample("File", "0x10000", "D:\\a.txt");
+        // Remove the SubjectUserName Data element
+        let to_remove = "<Data Name='SubjectUserName'>joao.silva</Data>";
+        xml = xml.replace(to_remove, "");
+        assert!(parse_4663(&xml).is_none());
     }
 }
