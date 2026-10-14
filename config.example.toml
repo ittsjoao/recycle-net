@@ -1,0 +1,18 @@
+# Copy to C:\ProgramData\rnetrbin\config.toml (path is fixed in the binary).
+# Paths must be drive-absolute (X:\...); UNC paths and drive roots are rejected.
+
+# Where the driver writes captured files. Must be empty or already contain the
+# .rnetrbin-root marker; the service creates the marker on first run.
+recycle_dir = 'D:\RecycleBinNet'
+
+# SQLite index of deleted files. Must NOT be inside recycle_dir.
+db_path = 'C:\ProgramData\rnetrbin\index.db'
+
+includes = ["*.*"]
+excludes = ["*.tmp", "~$*"]
+
+# Quota: oldest non-restored backups are evicted above this size (bytes).
+max_bin_bytes = 10737418240
+
+# Optional: evict backups older than this many days.
+# max_age_days = 30

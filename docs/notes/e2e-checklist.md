@@ -3,9 +3,27 @@
 Status: PENDING. Never run on a production workstation: the port is single-client and the steps stop services.
 
 ## VM setup
-- Original product installed, `netrbin.sys` loaded, `SNetRBin` service present.
+Two topologies; run the cases on both when possible.
+- **Standalone (target):** the original product is NOT installed. Copy `netrbin.sys`
+  from a licensed install, write the config, then from an elevated prompt:
+  `rnetrbin-svc.exe install --driver <path>\netrbin.sys` and `sc.exe start rnetrbin-svc`.
+- **Coexisting:** original product installed (`SNetRBin` present); `install` reuses the
+  driver and the service takes over SNetRBin at start.
 - A data volume plus an SMB share on it.
-- `rnetrbin-svc` config (TOML) with `recycle_dir` on that volume, `includes`, `excludes`, `max_bin_bytes`.
+- `C:\ProgramData\rnetrbin\config.toml` based on `config.example.toml`.
+
+## Install / uninstall (standalone)
+I1. `install` creates `netrbin` (Type=2, Start=0, Group=Filter, ErrorControl=0) with
+    `Instances\netrbin Instance` Altitude=370150 Flags=0; `fltmc` lists `netrbin` at 370150.
+I2. `install` twice is idempotent (no error, file not rewritten when identical).
+I3. `install` with a missing/invalid config fails before touching the system.
+I4. Reboot: driver loads at boot, `rnetrbin-svc` auto-starts and captures.
+I5. Driver signature loads on the target OS. Check with HVCI/Memory Integrity ON
+    (Windows 11 / Server 2022): the 2015 cross-signed driver may be blocked.
+I6. `uninstall` without SNetRBin: service gone, `netrbin` unloaded, service key and
+    `System32\drivers\netrbin.sys` removed (or "reboot required" and gone after reboot).
+I7. `uninstall` with SNetRBin installed (or `--keep-driver`): only our service is removed;
+    SNetRBin is back to its original start type and running.
 
 ## Cases
 1. Large file (multiple 64KB chunks, > 128KB) deleted over SMB: finalized backup plus SQLite row appear; restore by id matches bytes.
