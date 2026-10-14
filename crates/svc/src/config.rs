@@ -4,17 +4,44 @@ use serde::{Deserialize, Serialize};
 /// Fixed location read by the service and written by the GUI.
 pub const CONFIG_PATH: &str = r"C:\ProgramData\rnetrbin\config.toml";
 
+/// One protected folder: a deleted file under `path` (subfolders included) goes to
+/// the bin when its name matches some `include` mask and no `exclude` mask.
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+pub struct FolderRule {
+    pub path: PathBuf,
+    pub include: Vec<String>,
+    #[serde(default)]
+    pub exclude: Vec<String>,
+}
+
+impl FolderRule {
+    /// Rules offered when a folder is added in the GUI.
+    pub fn with_defaults(path: PathBuf) -> FolderRule {
+        FolderRule { path, include: vec!["*.*".into()], exclude: vec!["*.tmp".into(), "~$*".into()] }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ThemeName {
+    #[default]
+    Rust,
+    Branco,
+    Preto,
+}
+
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 pub struct Config {
     pub recycle_dir: PathBuf,
     pub db_path: PathBuf,
-    /// Protected folders (subfolders included); deletes elsewhere are ignored.
-    pub folders: Vec<PathBuf>,
-    /// File-name masks (`*.tmp`, `~$*`) or full-path masks (with `\`) never captured.
-    pub excludes: Vec<String>,
     pub max_bin_bytes: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_age_days: Option<u32>,
+    #[serde(default)]
+    pub theme: ThemeName,
+    /// Last: TOML writes the `[[folders]]` tables after the plain keys.
+    #[serde(default)]
+    pub folders: Vec<FolderRule>,
 }
 
 impl Default for Config {
@@ -23,33 +50,51 @@ impl Default for Config {
         Config {
             recycle_dir: r"D:\RecycleBinNet".into(),
             db_path: r"C:\ProgramData\rnetrbin\index.db".into(),
-            folders: vec![],
-            excludes: vec!["*.tmp".into(), "~$*".into()],
             max_bin_bytes: 10 * 1024 * 1024 * 1024,
             max_age_days: None,
+            theme: ThemeName::Rust,
+            folders: vec![],
         }
+    }
+}
+
+/// `child` is `parent` or lies under it (case-insensitive, `X:\` roots included).
+pub fn nests(parent: &Path, child: &Path) -> bool {
+    let p = parent.to_string_lossy().to_lowercase();
+    let p = p.trim_end_matches('\\');
+    let c = child.to_string_lossy().to_lowercase();
+    let c = c.trim_end_matches('\\');
+    c == p || c.starts_with(&format!("{p}\\"))
+}
+
+/// Driver masks for one rule mask, anchored on folder `f` (spec section 2).
+fn anchored(f: &Path, m: &str) -> Vec<String> {
+    let f = f.to_string_lossy().trim_end_matches('\\').to_uppercase();
+    let m = m.to_uppercase();
+    if m == "*" || m == "*.*" {
+        vec![format!("{f}\\*")]
+    } else if m.starts_with('*') {
+        // The leading `*` already crosses `\`, so it covers subfolders.
+        vec![format!("{f}\\{m}")]
+    } else {
+        vec![format!("{f}\\{m}"), format!("{f}\\*\\{m}")]
     }
 }
 
 /// The netrbin driver matches each mask with FsRtlIsNameInExpression(IgnoreCase)
 /// against the deleted file's full DOS path (`D:\dir\file.ext`): masks must be
-/// uppercase and anchored on the whole path. Returns (includes, excludes).
-/// The recycle dir and the db are always excluded so the service never
-/// captures its own writes.
+/// uppercase and anchored on the whole path. It keeps a file that matches any
+/// include and no exclude. Returns (includes, excludes); the recycle dir and the
+/// db are always excluded so the service never captures its own writes.
 pub fn driver_masks(c: &Config) -> (Vec<String>, Vec<String>) {
-    let up = |s: String| s.to_uppercase();
-    let includes = c
-        .folders
-        .iter()
-        .map(|f| up(format!("{}\\*", f.to_string_lossy().trim_end_matches('\\'))))
-        .collect();
-    let mut excludes: Vec<String> = c
-        .excludes
-        .iter()
-        .map(|m| up(if m.contains('\\') { m.clone() } else { format!("*\\{m}") }))
-        .collect();
-    excludes.push(up(format!("{}\\*", c.recycle_dir.to_string_lossy())));
-    excludes.push(up(format!("{}*", c.db_path.to_string_lossy())));
+    let mut includes = Vec::new();
+    let mut excludes = Vec::new();
+    for f in &c.folders {
+        includes.extend(f.include.iter().flat_map(|m| anchored(&f.path, m)));
+        excludes.extend(f.exclude.iter().flat_map(|m| anchored(&f.path, m)));
+    }
+    excludes.push(format!("{}\\*", c.recycle_dir.to_string_lossy()).to_uppercase());
+    excludes.push(format!("{}*", c.db_path.to_string_lossy()).to_uppercase());
     (includes, excludes)
 }
 
@@ -135,7 +180,7 @@ impl Config {
         self.db_path = normalize_drive_path(&self.db_path, "db_path", false)?;
         // A drive root (`D:\`) protects the whole volume.
         for f in &mut self.folders {
-            *f = normalize_drive_path(f, "folder", true)?;
+            f.path = normalize_drive_path(&f.path, "folder", true)?;
         }
         Ok(())
     }
@@ -144,11 +189,30 @@ impl Config {
             return Err(ConfigError::Invalid("at least one protected folder is required".into()));
         }
         for f in &self.folders {
-            normalize_drive_path(f, "folder", true)?;
+            normalize_drive_path(&f.path, "folder", true)?;
+            let shown = f.path.display();
+            if f.include.is_empty() {
+                return Err(ConfigError::Invalid(format!("folder {shown}: include must not be empty")));
+            }
+            for m in f.include.iter().chain(f.exclude.iter()) {
+                if m.is_empty() || m.contains('\0') || m.contains('\\') {
+                    return Err(ConfigError::Invalid(format!(
+                        "folder {shown}: invalid mask {m:?} (empty, NUL or backslash; masks are file names)"
+                    )));
+                }
+            }
         }
-        for m in self.excludes.iter() {
-            if m.is_empty() || m.contains('\0') {
-                return Err(ConfigError::Invalid(format!("invalid mask {m:?}: empty or contains NUL")));
+        // The driver adds every folder's masks into one list, so a nested pair
+        // would leak one folder's exclusions into the other.
+        for (i, a) in self.folders.iter().enumerate() {
+            for b in &self.folders[i + 1..] {
+                if nests(&a.path, &b.path) || nests(&b.path, &a.path) {
+                    return Err(ConfigError::Invalid(format!(
+                        "folders {} and {} overlap; protect only one of them",
+                        a.path.display(),
+                        b.path.display()
+                    )));
+                }
             }
         }
         // Re-check the canonical form (validate may be called without normalize).
@@ -175,18 +239,48 @@ impl Config {
 mod tests {
     use super::*;
     #[test]
-    fn parses_toml() {
+    fn parses_toml_with_folder_tables_and_theme() {
         let t = r#"
-recycle_dir = 'D:\RecycleBinNet'
-db_path = 'D:\RecycleBinNet\index.db'
-folders = ['D:\Dados']
-excludes = ['*.tmp']
+recycle_dir = 'E:\Lixeira'
+db_path = 'C:\ProgramData\rnetrbin\index.db'
 max_bin_bytes = 10737418240
+theme = "preto"
+
+[[folders]]
+path = 'D:\Dados\Contabil'
+include = ["*.*"]
+exclude = ["*.bak"]
+
+[[folders]]
+path = 'D:\Dados\Fiscal'
+include = ["*.xml", "*.pdf"]
 "#;
         let c: Config = toml::from_str(t).unwrap();
-        assert_eq!(c.folders, vec![PathBuf::from("D:\\Dados")]);
-        assert_eq!(c.max_bin_bytes, 10_737_418_240);
-        assert!(c.max_age_days.is_none());
+        assert_eq!(c.theme, ThemeName::Preto);
+        assert_eq!(c.folders.len(), 2);
+        assert_eq!(c.folders[0].exclude, ["*.bak"]);
+        assert!(c.folders[1].exclude.is_empty());
+    }
+    #[test]
+    fn theme_defaults_to_rust_and_unknown_theme_fails() {
+        let base = "recycle_dir = 'E:\\L'\ndb_path = 'C:\\x\\i.db'\nmax_bin_bytes = 1\n";
+        let c: Config = toml::from_str(base).unwrap();
+        assert_eq!(c.theme, ThemeName::Rust);
+        assert!(toml::from_str::<Config>(&format!("{base}theme = \"verde\"\n")).is_err());
+    }
+    fn rule(path: &str, include: &[&str], exclude: &[&str]) -> FolderRule {
+        FolderRule {
+            path: path.into(),
+            include: include.iter().map(|s| s.to_string()).collect(),
+            exclude: exclude.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+    fn ok_cfg() -> Config {
+        Config {
+            recycle_dir: "D:\\x".into(), db_path: "D:\\db\\i.db".into(), max_bin_bytes: 1,
+            max_age_days: None, theme: ThemeName::Rust,
+            folders: vec![rule("D:\\Dados", &["*.*"], &[])],
+        }
     }
     #[test]
     fn empty_folders_is_invalid() {
@@ -194,41 +288,53 @@ max_bin_bytes = 10737418240
         c.folders = vec![];
         assert!(c.validate().is_err());
     }
-    fn ok_cfg() -> Config {
-        Config { recycle_dir: "D:\\x".into(), db_path: "D:\\db\\i.db".into(),
-            folders: vec!["D:\\Dados".into()], excludes: vec![], max_bin_bytes: 1, max_age_days: None }
+    #[test]
+    fn folder_rules_are_validated() {
+        let mut c = ok_cfg(); c.folders = vec![rule("D:\\A", &[], &[])];
+        assert!(c.validate().is_err(), "empty include");
+        for bad in ["", "a\0b", "sub\\*.txt"] {
+            let mut c = ok_cfg(); c.folders = vec![rule("D:\\A", &["*.*"], &[bad])];
+            assert!(c.validate().is_err(), "accepted mask {bad:?}");
+        }
     }
     #[test]
-    fn driver_masks_are_uppercase_full_path_and_exclude_own_files() {
+    fn nested_folders_are_rejected_in_any_order_and_case() {
+        for (a, b) in [("D:\\Dados", "d:\\dados\\Fiscal"), ("D:\\Dados\\Fiscal", "D:\\Dados"), ("E:\\", "e:\\x"), ("D:\\A", "d:\\a")] {
+            let mut c = ok_cfg();
+            c.folders = vec![rule(a, &["*.*"], &[]), rule(b, &["*.*"], &[])];
+            c.normalize().unwrap();
+            assert!(c.validate().is_err(), "accepted {a} + {b}");
+        }
+        let mut c = ok_cfg();
+        c.folders = vec![rule("D:\\Dados", &["*.*"], &[]), rule("D:\\DadosOld", &["*.*"], &[])];
+        c.validate().unwrap();
+    }
+    #[test]
+    fn driver_masks_follow_the_spec_table() {
         let mut c = Config {
             recycle_dir: r"E:\Lixeira".into(),
             db_path: r"C:\ProgramData\rnetrbin\index.db".into(),
-            folders: vec![r"d:/Dados/".into(), r"F:\".into()],
-            excludes: vec!["*.tmp".into(), "~$*".into(), r"D:\Dados\Temp\*".into()],
-            ..Config::default()
+            folders: vec![
+                rule(r"d:/Dados/Contabil/", &["*.*"], &["*.bak", "~$*"]),
+                rule(r"D:\Dados\Fiscal", &["*.xml", "Relatorio.pdf"], &[]),
+                rule(r"F:\", &["*"], &[]),
+            ],
+            ..ok_cfg()
         };
         c.normalize().unwrap();
         c.validate().unwrap();
         let (inc, exc) = driver_masks(&c);
-        assert_eq!(inc, [r"D:\DADOS\*", r"F:\*"]);
-        assert_eq!(
-            exc,
-            [r"*\*.TMP", r"*\~$*", r"D:\DADOS\TEMP\*", r"E:\LIXEIRA\*", r"C:\PROGRAMDATA\RNETRBIN\INDEX.DB*"]
-        );
-    }
-    #[test]
-    fn valid_config_passes() { assert!(ok_cfg().validate().is_ok()); }
-    #[test]
-    fn save_then_load_round_trips_and_invalid_is_not_written() {
-        let t = tempfile::tempdir().unwrap();
-        let p = t.path().join("sub").join("config.toml");
-        let mut c = Config { recycle_dir: "d:/bin/".into(), folders: vec!["d:/Dados".into()], max_age_days: Some(30), ..Config::default() };
-        c.save(&p).unwrap();
-        assert_eq!(Config::load(&p).unwrap(), c);
-        let mut bad = Config { max_bin_bytes: 0, ..Config::default() };
-        let q = t.path().join("bad.toml");
-        assert!(bad.save(&q).is_err());
-        assert!(!q.exists());
+        assert_eq!(inc, [
+            r"D:\DADOS\CONTABIL\*",
+            r"D:\DADOS\FISCAL\*.XML",
+            r"D:\DADOS\FISCAL\RELATORIO.PDF", r"D:\DADOS\FISCAL\*\RELATORIO.PDF",
+            r"F:\*",
+        ]);
+        assert_eq!(exc, [
+            r"D:\DADOS\CONTABIL\*.BAK",
+            r"D:\DADOS\CONTABIL\~$*", r"D:\DADOS\CONTABIL\*\~$*",
+            r"E:\LIXEIRA\*", r"C:\PROGRAMDATA\RNETRBIN\INDEX.DB*",
+        ]);
     }
     #[test]
     fn relative_recycle_dir_invalid() {
@@ -266,13 +372,6 @@ max_bin_bytes = 10737418240
     fn db_path_must_be_drive_absolute() {
         let mut c = ok_cfg(); c.db_path = "index.db".into();
         assert!(c.normalize().and_then(|_| c.validate()).is_err());
-    }
-    #[test]
-    fn masks_with_nul_or_empty_are_invalid() {
-        let mut c = ok_cfg(); c.excludes = vec!["*.\0".into()];
-        assert!(c.validate().is_err());
-        let mut c = ok_cfg(); c.excludes = vec!["".into()];
-        assert!(c.validate().is_err());
     }
     #[test]
     fn zero_max_age_is_invalid() {

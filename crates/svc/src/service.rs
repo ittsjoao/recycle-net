@@ -841,8 +841,8 @@ mod tests {
         Config {
             recycle_dir: dir.join("recycle"),
             db_path: db,
-            folders: vec![dir.to_path_buf()],
-            excludes: vec![],
+            folders: vec![crate::config::FolderRule { path: dir.to_path_buf(), include: vec!["*".into()], exclude: vec![] }],
+            theme: Default::default(),
             max_bin_bytes: u64::MAX,
             max_age_days: None,
         }
@@ -1215,8 +1215,8 @@ mod tests_round3 {
         Config {
             recycle_dir: dir.join("recycle"),
             db_path: dir.join("db.sqlite"),
-            folders: vec![dir.to_path_buf()],
-            excludes: vec![],
+            folders: vec![crate::config::FolderRule { path: dir.to_path_buf(), include: vec!["*".into()], exclude: vec![] }],
+            theme: Default::default(),
             max_bin_bytes: u64::MAX,
             max_age_days: None,
         }

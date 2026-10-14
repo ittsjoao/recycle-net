@@ -7,7 +7,7 @@ use std::sync::Arc;
 use iced::widget::{button, checkbox, column, container, row, scrollable, text, text_input, Space};
 use iced::{Element, Length, Task};
 
-use crate::config::{Config, CONFIG_PATH};
+use crate::config::{Config, FolderRule, ThemeName, CONFIG_PATH};
 use crate::index::{Entry, Index};
 use crate::install::{self, SvcState};
 
@@ -60,8 +60,8 @@ impl Form {
         Form {
             recycle_dir: c.recycle_dir.display().to_string(),
             db_path: c.db_path.display().to_string(),
-            folders: c.folders.iter().map(|f| f.display().to_string()).collect(),
-            excludes: c.excludes.join("; "),
+            folders: c.folders.iter().map(|f| f.path.display().to_string()).collect(),
+            excludes: c.folders.first().map(|f| f.exclude.join("; ")).unwrap_or_else(|| "*.tmp; ~$*".into()),
             max_gb: format!("{}", (c.max_bin_bytes as f64 / GB * 100.0).round() / 100.0),
             max_age_days: c.max_age_days.map(|d| d.to_string()).unwrap_or_default(),
         }
@@ -82,8 +82,12 @@ impl Form {
         Ok(Config {
             recycle_dir: PathBuf::from(self.recycle_dir.trim()),
             db_path: PathBuf::from(self.db_path.trim()),
-            folders: self.folders.iter().map(PathBuf::from).collect(),
-            excludes: split_masks(&self.excludes),
+            folders: self
+                .folders
+                .iter()
+                .map(|p| FolderRule { path: PathBuf::from(p), include: vec!["*.*".into()], exclude: split_masks(&self.excludes) })
+                .collect(),
+            theme: ThemeName::Rust,
             max_bin_bytes: (gb * GB) as u64,
             max_age_days,
         })
@@ -601,19 +605,24 @@ mod tests {
 
     #[test]
     fn form_round_trips_config() {
-        let c = Config { folders: vec![r"D:\Dados".into(), r"E:\".into()], max_age_days: Some(30), ..Config::default() };
+        let c = Config {
+            folders: vec![FolderRule::with_defaults(r"D:\Dados".into()), FolderRule::with_defaults(r"E:\".into())],
+            max_age_days: Some(30),
+            ..Config::default()
+        };
         assert_eq!(Form::from_config(&c).to_config().unwrap(), c);
     }
 
     #[test]
     fn form_parses_masks_decimal_comma_and_empty_age() {
         let f = Form {
+            folders: vec![r"D:\Dados".into()],
             excludes: " *.docx ;; Relatório *.xlsx ".into(),
             max_gb: "1,5".into(),
             ..Form::from_config(&Config::default())
         };
         let c = f.to_config().unwrap();
-        assert_eq!(c.excludes, ["*.docx", "Relatório *.xlsx"]);
+        assert_eq!(c.folders[0].exclude, ["*.docx", "Relatório *.xlsx"]);
         assert_eq!(c.max_bin_bytes, (1.5 * GB) as u64);
         assert_eq!(c.max_age_days, None);
         assert!(Form { max_gb: "0".into(), ..f.clone() }.to_config().is_err());
