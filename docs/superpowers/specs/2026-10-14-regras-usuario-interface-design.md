@@ -15,7 +15,9 @@ Critérios de sucesso:
 - A lista mostra `DOMÍNIO\usuário` de quem apagou, ou "desconhecido".
 - Proteger uma pasta com 2 milhões de arquivos não reescreve nada nos arquivos.
 - A janela segue o modelo do Undelete Server (faixa de abas, árvore à esquerda,
-  lista à direita), sem ícones, tema Rust por padrão.
+  lista à direita), com ícones Material Icons, tema Rust por padrão.
+- A lista navega como o Explorer: mostra só o que está direto na pasta atual e
+  clicar numa subpasta entra nela.
 
 ## Fatos que sustentam o design
 
@@ -137,7 +139,8 @@ Se uma GPO sobrescrever a política, o serviço registra no log e a janela mostr
 
 ## 4. Interface (iced, mesmo exe)
 
-Mockup aprovado: `.superpowers/brainstorm/13008-1792007972/content/layout-undelete.html`.
+Mockup aprovado: `.superpowers/brainstorm/13276-1792010063/content/layout-undelete-v2.html`
+(fora do git; `.superpowers/` está no `.gitignore`).
 
 Título da janela: `rnetrbin - Lixeira de rede - <NOME DO SERVIDOR>`.
 
@@ -145,10 +148,11 @@ Abas da faixa:
 
 - **Arquivo**: Sobre, Sair.
 - **Início**:
-  - campo "Buscar na lixeira" (nome, subpasta ou usuário);
+  - campo "Buscar na lixeira": procura na pasta atual **e abaixo** (nome, subpasta
+    ou usuário) e mostra o caminho relativo de cada arquivo achado;
   - grupo Ações: Restaurar, Restaurar em..., Excluir, Ver cópias;
   - Atualizar;
-  - grupo Mostrar: [x] Incluir subpastas, [x] Todas as cópias.
+  - grupo Mostrar: [x] Todas as cópias.
 - **Pastas protegidas**: tabela Pasta / Incluir / Excluir / Apagados; Adicionar pasta
   (seletor do Windows; regras iniciais Incluir `*.*`, Excluir `*.tmp; ~$*`),
   Editar regras, Remover. Salvar reinicia o serviço.
@@ -159,22 +163,57 @@ Corpo da aba Início:
 
 - Esquerda, "Lixeira": árvore com raiz "Lixeira (N)", as pastas protegidas em negrito
   e, abaixo de cada uma, só as subpastas que têm arquivos apagados, com contagem.
-  Expandir/recolher por clique no marcador. Montada por função pura
-  `tree::build(paths) -> Tree` a partir dos caminhos originais não restaurados.
-- Direita, "Arquivos recuperáveis": colunas Nome, Cópias, Usuário, Tamanho,
-  Apagado em; ordenação por clique no cabeçalho; clique seleciona, Ctrl+clique
-  alterna, Shift+clique seleciona intervalo. "Cópias" = quantas versões não restauradas
-  do mesmo caminho existem. Com "Todas as cópias" desmarcado, mostra só a mais recente
-  de cada caminho; "Ver cópias" lista todas as versões do arquivo selecionado.
+  Expandir/recolher por clique no marcador; clicar no nome navega para a pasta.
+  Montada por função pura `tree::build(paths) -> Tree` a partir dos caminhos
+  originais não restaurados.
+- Direita, "Arquivos recuperáveis", navegação como o Explorer:
+  - acima da lista, o caminho clicável (`Lixeira › D:\Dados\Contabil › Clientes`) e
+    o botão "Acima" (sobe um nível);
+  - a lista mostra só o conteúdo **direto** da pasta atual: primeiro as subpastas que
+    têm algo apagado dentro (nome, quantidade de apagados, tamanho somado, data da
+    última exclusão), depois os arquivos daquele nível; na raiz "Lixeira", as
+    subpastas são as pastas protegidas;
+  - clicar numa subpasta entra nela; a árvore expande e marca o mesmo lugar;
+  - colunas Nome, Cópias, Usuário, Tamanho, Apagado em; ordenação por clique no
+    cabeçalho (subpastas sempre antes dos arquivos);
+  - clique seleciona arquivo, Ctrl+clique alterna, Shift+clique seleciona intervalo;
+    subpastas não são selecionáveis;
+  - "Cópias" = quantas versões não restauradas do mesmo caminho existem. Com "Todas
+    as cópias" desmarcado, mostra só a mais recente de cada caminho; "Ver cópias"
+    lista todas as versões do arquivo selecionado.
 - Barra de status: Serviço, Driver, Auditoria, uso da lixeira, quantidade selecionada.
 - Lista limitada a 1.000 linhas por visão, com aviso para refinar a busca.
 
 Primeiro uso (serviço não instalado): abre em Configurações com os campos mínimos
 (pasta da lixeira e a primeira pasta protegida) e o botão Instalar.
 
-Temas (sem ícones em nenhum): Rust (padrão; paleta do tema "Rust" do mdBook:
-fundo `#e1e1db`, lateral `#3b2e2a`, destaque `#b7410e`), Branco e Preto, conforme o
-mockup `temas-a.html`. O tema escolhido fica em `config.theme`.
+Temas: Rust (padrão; paleta do tema "Rust" do mdBook: fundo `#e1e1db`, painel
+`#ecebe5`, destaque `#b7410e`), Branco e Preto, com as cores do mockup. O tema
+escolhido fica em `config.theme`.
+
+Ícones: fonte **Material Icons** (regular) do Google, a mesma usada pelo
+`iced-material-icon-browser`. O arquivo `MaterialIcons-Regular.ttf` (licença
+Apache 2.0, do repositório `google/material-design-icons`) fica em `crates/svc/assets/`
+com o texto da licença ao lado, é embutido com `include_bytes!` e carregado na
+inicialização do iced; cada ícone é um `text` com o codepoint na fonte. Ícones usados
+(nome Material → onde):
+
+| Ícone | Onde |
+|---|---|
+| `restore`, `drive_file_move`, `delete_forever`, `history`, `refresh` | Início: Restaurar, Restaurar em..., Excluir, Ver cópias, Atualizar |
+| `search` | campo de busca |
+| `create_new_folder`, `rule`, `folder_off` | Pastas protegidas: Adicionar, Editar regras, Remover |
+| `save`, `install_desktop`, `play_circle`, `stop_circle` | Configurações: Salvar, Instalar, Iniciar, Parar |
+| `delete` | raiz "Lixeira" na árvore e no caminho |
+| `folder_special` | pasta protegida |
+| `folder` / `folder_open` | subpasta / subpasta atual |
+| `description` | arquivo na lista |
+| `arrow_upward` | botão Acima |
+| `check_circle` / `error` | estado na barra de status (ok / problema) |
+| `delete_sweep` | título da janela |
+
+Os codepoints ficam em constantes num módulo `gui/icons.rs`, conferidos contra o
+`MaterialIcons-Regular.codepoints` do mesmo repositório.
 
 Restaurar e excluir mantêm as regras atuais: restaurar no local original nunca
 sobrescreve; "Restaurar em..." recusa destino existente; excluir apaga arquivo e linha.
@@ -184,10 +223,13 @@ sobrescreve; "Restaurar em..." recusa destino existente; excluir apaga arquivo e
 - `config.rs`: novo modelo, validação, `driver_masks`.
 - `audit.rs` (novo): trait `Audit` + `WinAudit`; `parse_4663`; assinatura de eventos.
 - `index.rs`: tabela `delete_events`; preencher usuário; contagem de cópias; listagem
-  por pasta (com/sem subpastas, todas/últimas cópias).
+  do conteúdo direto de uma pasta (subpastas com agregados + arquivos do nível),
+  busca na pasta e abaixo, todas/últimas cópias.
 - `service.rs`: inicia a assinatura e o preenchimento periódico de usuário.
-- `gui/` (substitui `gui.rs`): `mod.rs` (estado e update), `theme.rs`, `tree.rs`
-  (árvore pura), `home.rs` (faixa, árvore, lista), `folders.rs`, `settings.rs`.
+- `gui/` (substitui `gui.rs`): `mod.rs` (estado e update), `theme.rs`, `icons.rs`,
+  `tree.rs` (árvore pura), `home.rs` (faixa, árvore, caminho, lista), `folders.rs`,
+  `settings.rs`.
+- `crates/svc/assets/`: `MaterialIcons-Regular.ttf` + `LICENSE` (Apache 2.0).
 - `install.rs`: `uninstall` desfaz a auditoria conforme `audit-state.json`.
 
 ## 6. Testes
@@ -200,7 +242,11 @@ Unitários (sem Windows real):
 - `match_event`: dentro e fora da janela de 120 s, o mais próximo entre vários.
 - `tree::build`: contagens agregadas, só subpastas com apagados, pastas protegidas na
   raiz.
-- Índice: cópias por caminho, listagem com/sem subpastas e todas/últimas cópias.
+- Índice: cópias por caminho; conteúdo direto de uma pasta (subpastas com quantidade,
+  tamanho e última exclusão; arquivos só do nível); busca na pasta e abaixo;
+  todas/últimas cópias.
+- Ícones: cada constante de `gui/icons.rs` bate com o codepoint do arquivo
+  `.codepoints` (teste lê o arquivo de `assets/`).
 
 Win32 (`WinAudit`, SCM, driver) sem teste automático, como hoje. Manual no servidor:
 apagar pelo SMB em pasta protegida e conferir arquivo na lixeira, coluna Usuário,
