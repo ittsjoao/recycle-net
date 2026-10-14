@@ -22,6 +22,9 @@ pub struct AuditState {
     pub policy_before: u8,
     /// Account the global SACL entry was created for.
     pub sacl_sid: String,
+    /// The admin already had a global SACL entry for that account; we leave it alone.
+    #[serde(default)]
+    pub sacl_existed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -75,8 +78,32 @@ pub fn sacl_args(sid: &str) -> Vec<String> {
         .collect()
 }
 
+pub fn sacl_view_args(sid: &str) -> Vec<String> {
+    vec!["/resourceSACL".into(), "/type:File".into(), "/view".into(), format!("/user:{{{sid}}}")]
+}
+
+/// A global SACL entry exists: some line's value after the first ':' is "File" (language independent).
+pub fn parse_sacl_view_has_entry(out: &str) -> bool {
+    out.lines().any(|l| l.split_once(':').is_some_and(|(_, v)| v.trim() == "File"))
+}
+
+/// The entry audits DELETE (an access line equal to "DELETE").
+pub fn sacl_view_has_delete(out: &str) -> bool {
+    out.lines().any(|l| l.trim() == "DELETE")
+}
+
+/// Full path under System32 so a planted exe is never run as SYSTEM.
+fn tool(name: &str) -> String {
+    let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    format!(r"{root}\System32\{name}.exe")
+}
+
 fn run(cmd: &str, args: &[String]) -> Result<String, String> {
-    let out = Command::new(cmd).args(args).output().map_err(|e| format!("{cmd}: {e}"))?;
+    use std::os::windows::process::CommandExt;
+    let out = Command::new(cmd)
+        .args(args)
+        .creation_flags(0x0800_0000) // CREATE_NO_WINDOW
+        .output().map_err(|e| format!("{cmd}: {e}"))?;
     let text = |b: &[u8]| String::from_utf8_lossy(b).trim().to_string();
     if out.status.success() {
         Ok(text(&out.stdout))
@@ -85,10 +112,10 @@ fn run(cmd: &str, args: &[String]) -> Result<String, String> {
     }
 }
 
-/// Current "Setting Value" of the File System subcategory (0 when not listed).
+/// Current "Setting Value" of the File System subcategory (Err when the backup cannot be parsed).
 fn current_setting() -> Result<u8, String> {
     let file = std::env::temp_dir().join(format!("rnetrbin-auditpol-{}.csv", std::process::id()));
-    run("auditpol", &["/backup".into(), format!("/file:{}", file.display())])?;
+    run(&tool("auditpol"), &["/backup".into(), format!("/file:{}", file.display())])?;
     let bytes = std::fs::read(&file).map_err(|e| e.to_string());
     let _ = std::fs::remove_file(&file);
     let bytes = bytes?;
@@ -99,7 +126,10 @@ fn current_setting() -> Result<u8, String> {
     } else {
         String::from_utf8_lossy(&bytes).into_owned()
     };
-    Ok(parse_backup_setting(&csv, FILE_SYSTEM_SUBCATEGORY).unwrap_or(0))
+    if csv.trim().is_empty() {
+        return Ok(0);
+    }
+    parse_backup_setting(&csv, FILE_SYSTEM_SUBCATEGORY).ok_or_else(|| "auditpol backup has no File System line".to_string())
 }
 
 /// SID of the machine's primary domain, None in a workgroup.
@@ -137,25 +167,40 @@ pub fn primary_domain_sid() -> Option<String> {
     }
 }
 
-/// Idempotent. Records the previous policy once, then turns on success
-/// auditing, sets the global DELETE SACL and grows the Security log.
+/// Idempotent. Records the previous policy and global SACL once, then turns on
+/// success auditing, sets the global DELETE SACL (unless the admin already has an
+/// entry for the account) and grows the Security log.
 pub fn ensure() -> Result<(), String> {
     let before = current_setting()?;
-    let sid = audit_users_sid(primary_domain_sid().as_deref());
-    if !Path::new(STATE_PATH).exists() {
-        let state = AuditState { policy_before: before, sacl_sid: sid.clone() };
-        if let Some(parent) = Path::new(STATE_PATH).parent() {
-            std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    let state = match std::fs::read_to_string(STATE_PATH).ok().and_then(|t| toml::from_str::<AuditState>(&t).ok()) {
+        Some(state) => state,
+        None => {
+            let sid = audit_users_sid(primary_domain_sid().as_deref());
+            let view = run(&tool("auditpol"), &sacl_view_args(&sid))?;
+            let sacl_existed = parse_sacl_view_has_entry(&view);
+            if sacl_existed && !sacl_view_has_delete(&view) {
+                tracing::warn!("existing global SACL entry for {sid} does not audit DELETE; leaving it untouched");
+            }
+            let state = AuditState { policy_before: before, sacl_sid: sid, sacl_existed };
+            if let Some(parent) = Path::new(STATE_PATH).parent() {
+                std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+            }
+            std::fs::write(STATE_PATH, toml::to_string(&state).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+            state
         }
-        std::fs::write(STATE_PATH, toml::to_string(&state).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
-    }
+    };
     if before & 1 == 0 {
-        run("auditpol", &policy_args(before | 1))?;
+        run(&tool("auditpol"), &policy_args(before | 1))?;
     }
-    run("auditpol", &sacl_args(&sid))?;
-    let size = parse_max_size(&run("wevtutil", &["gl".into(), "Security".into()])?).unwrap_or(0);
-    if size < MIN_SECURITY_LOG_BYTES {
-        run("wevtutil", &["sl".into(), "Security".into(), format!("/ms:{MIN_SECURITY_LOG_BYTES}")])?;
+    if !state.sacl_existed {
+        run(&tool("auditpol"), &sacl_args(&state.sacl_sid))?;
+    }
+    match parse_max_size(&run(&tool("wevtutil"), &["gl".into(), "Security".into()])?) {
+        Some(size) if size < MIN_SECURITY_LOG_BYTES => {
+            run(&tool("wevtutil"), &["sl".into(), "Security".into(), format!("/ms:{MIN_SECURITY_LOG_BYTES}")])?;
+        }
+        Some(_) => {}
+        None => tracing::warn!("could not read the Security log size; not resizing it"),
     }
     Ok(())
 }
@@ -171,11 +216,11 @@ pub fn status() -> AuditStatus {
 pub fn undo() -> Result<(), String> {
     let Ok(text) = std::fs::read_to_string(STATE_PATH) else { return Ok(()) };
     let state: AuditState = toml::from_str(&text).map_err(|e| e.to_string())?;
-    run("auditpol", &policy_args(state.policy_before))?;
-    run(
-        "auditpol",
-        &["/resourceSACL".into(), "/remove".into(), "/type:File".into(), format!("/user:{{{}}}", state.sacl_sid)],
-    )?;
+    run(&tool("auditpol"), &policy_args(state.policy_before))?;
+    if !state.sacl_existed {
+        let remove = ["/resourceSACL".into(), "/remove".into(), "/type:File".into(), format!("/user:{{{}}}", state.sacl_sid)];
+        run(&tool("auditpol"), &remove)?;
+    }
     std::fs::remove_file(STATE_PATH).map_err(|e| e.to_string())
 }
 
@@ -205,6 +250,29 @@ SRV,System,Logon,{0CCE9215-69AE-11D9-BED3-505054503030},Êxito,,1\r\n";
     fn audit_users_are_domain_users_or_builtin_users() {
         assert_eq!(audit_users_sid(Some("S-1-5-21-1-2-3")), "S-1-5-21-1-2-3-513");
         assert_eq!(audit_users_sid(None), "S-1-5-32-545");
+    }
+
+    const SACL_ENTRY: &str = "Entrada:            1
+Tipo de Recurso:    File
+Usuário:             BUILTIN\\Usuários
+Sinalizadores:            Êxito
+Condição:        (null)
+Acessos:
+    DELETE
+
+Comando executado com êxito.
+";
+    const SACL_NONE: &str = "No momento, não há nenhum SACL global para o tipo de recurso.
+Comando executado com êxito.
+";
+
+    #[test]
+    fn reads_sacl_view() {
+        assert!(parse_sacl_view_has_entry(SACL_ENTRY));
+        assert!(!parse_sacl_view_has_entry(SACL_NONE));
+        assert!(sacl_view_has_delete(SACL_ENTRY));
+        assert!(!sacl_view_has_delete(&SACL_ENTRY.replace("DELETE", "WRITE_DAC")));
+        assert!(!sacl_view_has_delete(SACL_NONE));
     }
 
     #[test]
