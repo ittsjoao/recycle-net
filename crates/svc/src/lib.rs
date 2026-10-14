@@ -10,3 +10,4 @@ pub mod service;
 pub mod install;
 pub mod gui;
 pub mod attribution;
+pub mod audit;
