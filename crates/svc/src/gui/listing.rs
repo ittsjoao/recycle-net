@@ -49,27 +49,34 @@ pub fn build(tree: &Tree, rows: &[Version], v: &View) -> Listing {
     let q = v.query.trim().to_lowercase();
     let cur = key(v.cur);
     let below = |p: &str| cur.is_empty() || key(p).starts_with(&format!("{cur}\\"));
+    // Part of the path under the current folder (the whole path at the root).
+    let cur_len = v.cur.trim_end_matches('\\').len();
+    let relative = |p: &str| -> String {
+        if cur_len == 0 { p } else { p.get(cur_len + 1..).unwrap_or(p) }.to_lowercase()
+    };
+    // Newest backup per path over ALL rows, before any filtering.
+    let newest: Option<HashMap<String, (i64, i64)>> = (!v.all_copies && v.copies_of.is_none()).then(|| {
+        let mut m: HashMap<String, (i64, i64)> = HashMap::new();
+        for r in rows {
+            let e = m.entry(key(&r.original_path)).or_insert((r.deleted_utc, r.id));
+            *e = (*e).max((r.deleted_utc, r.id));
+        }
+        m
+    });
     let mut files: Vec<Version> = rows
         .iter()
         .filter(|r| match (v.copies_of, q.is_empty()) {
             (Some(p), _) => key(&r.original_path) == key(p),
             (None, false) => {
                 below(&r.original_path)
-                    && (r.original_path.to_lowercase().contains(&q)
+                    && (relative(&r.original_path).contains(&q)
                         || r.user_name.as_deref().unwrap_or("").to_lowercase().contains(&q))
             }
             (None, true) => key(parent(&r.original_path)) == cur,
         })
+        .filter(|r| newest.as_ref().is_none_or(|n| n[&key(&r.original_path)] == (r.deleted_utc, r.id)))
         .cloned()
         .collect();
-    if !v.all_copies && v.copies_of.is_none() {
-        let mut newest: HashMap<String, (i64, i64)> = HashMap::new();
-        for f in &files {
-            let e = newest.entry(key(&f.original_path)).or_insert((f.deleted_utc, f.id));
-            *e = (*e).max((f.deleted_utc, f.id));
-        }
-        files.retain(|f| newest[&key(&f.original_path)] == (f.deleted_utc, f.id));
-    }
     sort(&mut files, v.sort);
     let total_files = files.len();
     files.truncate(v.limit);
@@ -219,6 +226,22 @@ mod tests {
         assert_eq!(l.files.len(), 1000);
         assert_eq!(l.total_files, 1500);
         assert_eq!(l.files[0].id, 1500, "newest first");
+    }
+
+    #[test]
+    fn search_ignores_folders_above_current() {
+        let r = rows();
+        let t = tree(&r);
+        assert!(ids(&build(&t, &r, &view(r"D:\Dados\Sub", "dados"))).is_empty());
+        assert_eq!(ids(&build(&t, &r, &view(r"D:\Dados\Sub", "deep"))), [4]);
+    }
+
+    #[test]
+    fn latest_copy_is_chosen_before_search_filter() {
+        let r = vec![v(1, r"D:\Dados\a.txt", 5, Some("ana"), 2), v(2, r"D:\Dados\a.txt", 9, Some("bia"), 2)];
+        let mut q = view(r"D:\Dados", "ana");
+        q.all_copies = false;
+        assert!(build(&tree(&r), &r, &q).files.is_empty());
     }
 
     #[test]
