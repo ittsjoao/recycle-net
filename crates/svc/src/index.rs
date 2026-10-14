@@ -1,6 +1,6 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection, OptionalExtension};
 
 pub struct DeletedFile {
     pub original_path: String, pub backup_path: String, pub volume: String,
@@ -11,6 +11,25 @@ pub struct DeletedFile {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Entry {
     pub id: i64, pub original_path: String, pub size: i64, pub deleted_utc: i64,
+}
+/// A 4663 Security event with DELETE access (who removed `path`, and when).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeleteEvent {
+    pub path: String,
+    pub user: String,
+    pub sid: String,
+    pub utc: i64,
+}
+
+/// A non-restored backup with how many backups share its original path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Version {
+    pub id: i64,
+    pub original_path: String,
+    pub size: i64,
+    pub deleted_utc: i64,
+    pub user_name: Option<String>,
+    pub copies: i64,
 }
 /// Thread-safe: the single SQLite connection is guarded by a Mutex.
 pub struct Index { conn: Mutex<Connection> }
@@ -24,6 +43,10 @@ CREATE INDEX IF NOT EXISTS ix_deleted_utc ON deleted_files(deleted_utc);
 CREATE INDEX IF NOT EXISTS ix_original_path ON deleted_files(original_path);
 CREATE INDEX IF NOT EXISTS ix_volume ON deleted_files(volume);
 CREATE INDEX IF NOT EXISTS ix_backup_path ON deleted_files(backup_path);
+CREATE TABLE IF NOT EXISTS delete_events(
+  path_upper TEXT NOT NULL, user TEXT NOT NULL, sid TEXT NOT NULL, utc INTEGER NOT NULL);
+CREATE INDEX IF NOT EXISTS ix_de_path ON delete_events(path_upper, utc);
+CREATE TABLE IF NOT EXISTS kv(k TEXT PRIMARY KEY, v TEXT NOT NULL);
 "#;
 
 impl Index {
@@ -140,6 +163,64 @@ impl Index {
         }))?;
         Ok((rows.collect::<rusqlite::Result<_>>()?, total))
     }
+    /// Paths are stored uppercased (Rust `to_uppercase`) so lookups ignore case.
+    pub fn add_delete_event(&self, e: &DeleteEvent) -> rusqlite::Result<()> {
+        self.c().execute(
+            "INSERT INTO delete_events(path_upper,user,sid,utc) VALUES(?1,?2,?3,?4)",
+            params![e.path.to_uppercase(), e.user, e.sid, e.utc],
+        )?;
+        Ok(())
+    }
+    pub fn events_for(&self, path: &str, from: i64, to: i64) -> rusqlite::Result<Vec<DeleteEvent>> {
+        let conn = self.c();
+        let mut st = conn.prepare(
+            "SELECT path_upper,user,sid,utc FROM delete_events WHERE path_upper=?1 AND utc BETWEEN ?2 AND ?3",
+        )?;
+        let rows = st.query_map(params![path.to_uppercase(), from, to], |r| {
+            Ok(DeleteEvent { path: r.get(0)?, user: r.get(1)?, sid: r.get(2)?, utc: r.get(3)? })
+        })?;
+        rows.collect()
+    }
+    pub fn prune_delete_events(&self, before: i64) -> rusqlite::Result<usize> {
+        self.c().execute("DELETE FROM delete_events WHERE utc < ?1", [before])
+    }
+    /// (id, original_path, deleted_utc) of non-restored rows still without a user.
+    pub fn pending_attribution(&self, since: i64) -> rusqlite::Result<Vec<(i64, String, i64)>> {
+        let conn = self.c();
+        let mut st = conn.prepare(
+            "SELECT id,original_path,deleted_utc FROM deleted_files
+             WHERE user_name IS NULL AND is_restored=0 AND deleted_utc >= ?1",
+        )?;
+        let rows = st.query_map([since], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))?;
+        rows.collect()
+    }
+    pub fn set_user(&self, id: i64, user: &str, sid: &str) -> rusqlite::Result<()> {
+        self.c().execute("UPDATE deleted_files SET user_name=?2, user_sid=?3 WHERE id=?1", params![id, user, sid])?;
+        Ok(())
+    }
+    pub fn get_kv(&self, k: &str) -> rusqlite::Result<Option<String>> {
+        self.c().query_row("SELECT v FROM kv WHERE k=?1", [k], |r| r.get(0)).optional()
+    }
+    pub fn set_kv(&self, k: &str, v: &str) -> rusqlite::Result<()> {
+        self.c().execute("INSERT OR REPLACE INTO kv(k,v) VALUES(?1,?2)", [k, v])?;
+        Ok(())
+    }
+    /// Every non-restored backup, with its copy count (case-insensitive path).
+    pub fn all_versions(&self) -> rusqlite::Result<Vec<Version>> {
+        let conn = self.c();
+        let mut st = conn.prepare(
+            "SELECT id,original_path,size,deleted_utc,user_name,
+                    COUNT(*) OVER (PARTITION BY lower(original_path))
+             FROM deleted_files WHERE is_restored=0",
+        )?;
+        let rows = st.query_map([], |r| {
+            Ok(Version {
+                id: r.get(0)?, original_path: r.get(1)?, size: r.get(2)?, deleted_utc: r.get(3)?,
+                user_name: r.get(4)?, copies: r.get(5)?,
+            })
+        })?;
+        rows.collect()
+    }
     pub fn count_by_backup_path(&self, backup_path: &str) -> rusqlite::Result<i64> {
         self.c().query_row("SELECT COUNT(*) FROM deleted_files WHERE backup_path=?1",
             [backup_path], |r| r.get(0))
@@ -217,5 +298,53 @@ mod tests {
         let old = idx.oldest_unrestored(10).unwrap();
         assert_eq!(old.len(), 1);
         assert_eq!(old[0].0, id1 + 1);
+    }
+    fn ev(path: &str, user: &str, utc: i64) -> DeleteEvent {
+        DeleteEvent { path: path.into(), user: user.into(), sid: "S-1-5-21-1".into(), utc }
+    }
+    #[test]
+    fn events_match_case_insensitively_and_by_time_range() {
+        let idx = Index::open_memory().unwrap();
+        idx.add_delete_event(&ev("d:\\dados\\A.txt", "AUSTER\\ana", 100)).unwrap();
+        idx.add_delete_event(&ev("D:\\Dados\\a.TXT", "AUSTER\\bia", 500)).unwrap();
+        let got = idx.events_for("D:\\DADOS\\A.TXT", 0, 200).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].user, "AUSTER\\ana");
+        assert_eq!(idx.prune_delete_events(200).unwrap(), 1);
+        assert_eq!(idx.events_for("D:\\Dados\\a.txt", 0, 1000).unwrap().len(), 1);
+    }
+    #[test]
+    fn pending_attribution_and_set_user() {
+        let idx = Index::open_memory().unwrap();
+        let old = idx.insert(&sample(10, 1)).unwrap();
+        let new = idx.insert(&sample(1000, 1)).unwrap();
+        assert_eq!(idx.pending_attribution(500).unwrap().iter().map(|r| r.0).collect::<Vec<_>>(), [new]);
+        idx.set_user(new, "AUSTER\\ana", "S-1").unwrap();
+        assert!(idx.pending_attribution(0).unwrap().iter().all(|r| r.0 == old));
+    }
+    #[test]
+    fn kv_round_trips() {
+        let idx = Index::open_memory().unwrap();
+        assert_eq!(idx.get_kv("a").unwrap(), None);
+        idx.set_kv("a", "1").unwrap();
+        idx.set_kv("a", "2").unwrap();
+        assert_eq!(idx.get_kv("a").unwrap().as_deref(), Some("2"));
+    }
+    #[test]
+    fn all_versions_counts_copies_per_path_and_skips_restored() {
+        let idx = Index::open_memory().unwrap();
+        let mut a1 = sample(1, 10); a1.original_path = "D:\\x\\a.txt".into();
+        let mut a2 = sample(2, 20); a2.original_path = "d:\\X\\A.txt".into();
+        let b = sample(3, 30);
+        let r = sample(4, 40);
+        idx.insert(&a1).unwrap();
+        idx.insert(&a2).unwrap();
+        idx.insert(&b).unwrap();
+        let rid = idx.insert(&r).unwrap();
+        idx.mark_restored(rid).unwrap();
+        let mut v = idx.all_versions().unwrap();
+        v.sort_by_key(|x| x.deleted_utc);
+        assert_eq!(v.iter().map(|x| x.copies).collect::<Vec<_>>(), [2, 2, 1]);
+        assert_eq!(v[0].user_name, None);
     }
 }
