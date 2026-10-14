@@ -110,7 +110,7 @@ mock nos testes).
    Nenhum arquivo é tocado. A sintaxe exata de `/access` para DELETE é conferida com
    `auditpol /resourceSACL /view` como primeiro passo da implementação.
 3. Se o log de Segurança tiver menos de 512 MB, aumenta para 512 MB (nunca diminui).
-4. Grava em `C:\ProgramData\rnetrbin\audit-state.json` o que existia antes (política
+4. Grava em `C:\ProgramData\rnetrbin\audit-state.toml` o que existia antes (política
    da subcategoria, entrada global), para o `uninstall` desfazer só o que o rnetrbin
    mudou. O tamanho do log não é revertido.
 
