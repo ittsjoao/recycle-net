@@ -185,9 +185,7 @@ impl Config {
         Ok(())
     }
     pub fn validate(&self) -> Result<(), ConfigError> {
-        if self.folders.is_empty() {
-            return Err(ConfigError::Invalid("at least one protected folder is required".into()));
-        }
+        // Zero folders is valid: the driver gets no include mask and keeps nothing.
         for f in &self.folders {
             normalize_drive_path(&f.path, "folder", true)?;
             let shown = f.path.display();
@@ -283,10 +281,15 @@ include = ["*.xml", "*.pdf"]
         }
     }
     #[test]
-    fn empty_folders_is_invalid() {
+    fn empty_folders_is_valid_and_sends_no_include() {
+        // Removing the last folder is allowed: the driver then keeps nothing
+        // (it keeps a file only when some include mask matches).
         let mut c = ok_cfg();
         c.folders = vec![];
-        assert!(c.validate().is_err());
+        c.validate().unwrap();
+        let (inc, exc) = driver_masks(&c);
+        assert!(inc.is_empty());
+        assert_eq!(exc, [r"D:\X\*", r"D:\DB\I.DB*"]);
     }
     #[test]
     fn folder_rules_are_validated() {
