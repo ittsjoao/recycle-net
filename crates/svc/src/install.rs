@@ -1,5 +1,5 @@
-//! Standalone install: ship our own copy of `netrbin.sys`, register it as a
-//! minifilter exactly as the original installer does, and register
+//! Standalone install: ship our own copy of `netrbin.sys` (embedded at build
+//! time, see build.rs), register it as a minifilter exactly as the original installer does, and register
 //! `rnetrbin-svc`. The original product (SNetRBin) is not required; when it is
 //! present, uninstall leaves the shared driver in place for it.
 use std::path::{Path, PathBuf};
@@ -19,6 +19,9 @@ pub const OWN_SERVICE: &str = "rnetrbin-svc";
 pub const OWN_DISPLAY_NAME: &str = "rnetrbin network recycle bin";
 pub const ORIGINAL_SERVICE: &str = "SNetRBin";
 
+/// The driver image packaged into this binary by build.rs.
+pub static EMBEDDED_DRIVER: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/netrbin.sys"));
+
 /// Must exceed the service's worst-case handback on STOP (see main.rs STOP_WAIT_HINT).
 const OWN_STOP_TIMEOUT: Duration = Duration::from_secs(120);
 const DRIVER_STOP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -37,8 +40,8 @@ fn step(step: &'static str) -> impl FnOnce(String) -> InstallError {
 
 /// System operations used by install/uninstall. Every method is idempotent.
 pub trait Host {
-    /// Copy `src` over `%SystemRoot%\System32\drivers\netrbin.sys` unless identical.
-    fn copy_driver(&self, src: &Path) -> Result<(), String>;
+    /// Write `image` to `%SystemRoot%\System32\drivers\netrbin.sys` unless identical.
+    fn copy_driver(&self, image: &[u8]) -> Result<(), String>;
     /// Create the minifilter service and its default instance (altitude) keys.
     fn ensure_driver_service(&self) -> Result<(), String>;
     /// Load the minifilter (already running is Ok).
@@ -56,8 +59,9 @@ pub trait Host {
     fn remove_driver_file(&self) -> Result<bool, String>;
 }
 
-/// Reject anything that is obviously not a driver image before touching the system.
-pub fn validate_driver_source(src: &Path) -> Result<(), InstallError> {
+/// Read a `--driver` override, rejecting anything that is obviously not a
+/// driver image before touching the system.
+pub fn read_driver_override(src: &Path) -> Result<Vec<u8>, InstallError> {
     let bad = |why: &str| InstallError::Source(src.to_path_buf(), why.into());
     let is_sys = src.extension().is_some_and(|e| e.eq_ignore_ascii_case("sys"));
     if !is_sys {
@@ -67,14 +71,13 @@ pub fn validate_driver_source(src: &Path) -> Result<(), InstallError> {
     if !bytes.starts_with(b"MZ") {
         return Err(bad("not a PE image (missing MZ header)"));
     }
-    Ok(())
+    Ok(bytes)
 }
 
 /// Install order: driver file, driver service, load it, then our service. The
 /// service is not started here; `sc start rnetrbin-svc` is left to the operator.
-pub fn install<H: Host>(host: &H, driver_src: &Path, exe: &Path) -> Result<(), InstallError> {
-    validate_driver_source(driver_src)?;
-    host.copy_driver(driver_src).map_err(step("copy driver"))?;
+pub fn install<H: Host>(host: &H, driver: &[u8], exe: &Path) -> Result<(), InstallError> {
+    host.copy_driver(driver).map_err(step("copy driver"))?;
     host.ensure_driver_service().map_err(step("register driver"))?;
     host.start_driver().map_err(step("load driver"))?;
     host.ensure_own_service(exe).map_err(step("register service"))?;
@@ -116,6 +119,49 @@ pub fn uninstall<H: Host>(host: &H, keep_driver: bool) -> Result<Uninstalled, In
 pub fn drivers_dir() -> PathBuf {
     let root = std::env::var_os("SystemRoot").unwrap_or_else(|| r"C:\Windows".into());
     PathBuf::from(root).join("System32").join("drivers")
+}
+
+/// Command-line flag the SCM passes so the exe runs as the service (no flag opens the GUI).
+pub const SERVICE_ARG: &str = "--service";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SvcState {
+    NotInstalled,
+    Stopped,
+    Running,
+    /// Start/stop pending or paused.
+    Busy,
+}
+
+pub fn service_state(name: &str) -> Result<SvcState, String> {
+    use windows::Win32::System::Services::*;
+    let Some(s) = win::open(name, SERVICE_QUERY_STATUS)? else {
+        return Ok(SvcState::NotInstalled);
+    };
+    let mut st = SERVICE_STATUS::default();
+    unsafe { QueryServiceStatus(s.svc, &mut st) }.map_err(|e| format!("query {name}: {e}"))?;
+    Ok(match st.dwCurrentState {
+        SERVICE_STOPPED => SvcState::Stopped,
+        SERVICE_RUNNING => SvcState::Running,
+        _ => SvcState::Busy,
+    })
+}
+
+/// Start a service; already running is Ok.
+pub fn start_service(name: &str) -> Result<(), String> {
+    use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
+    use windows::Win32::System::Services::*;
+    let s = win::open(name, SERVICE_START)?.ok_or_else(|| format!("{name} is not installed"))?;
+    match unsafe { StartServiceW(s.svc, None) } {
+        Ok(()) => Ok(()),
+        Err(e) if e.code() == ERROR_SERVICE_ALREADY_RUNNING.to_hresult() => Ok(()),
+        Err(e) => Err(format!("start {name}: {e}")),
+    }
+}
+
+/// Stop `rnetrbin-svc` and wait for it; not running is Ok.
+pub fn stop_own_service() -> Result<(), String> {
+    win::stop(OWN_SERVICE, OWN_STOP_TIMEOUT)
 }
 
 /// Real Win32 implementation (requires an elevated process).
@@ -260,14 +306,13 @@ impl WinHost {
 }
 
 impl Host for WinHost {
-    fn copy_driver(&self, src: &Path) -> Result<(), String> {
+    fn copy_driver(&self, image: &[u8]) -> Result<(), String> {
         let dst = drivers_dir().join(DRIVER_FILE);
-        let new = std::fs::read(src).map_err(|e| format!("read {}: {e}", src.display()))?;
-        if std::fs::read(&dst).is_ok_and(|cur| cur == new) {
+        if std::fs::read(&dst).is_ok_and(|cur| cur == image) {
             tracing::info!("{} already up to date", dst.display());
             return Ok(());
         }
-        std::fs::write(&dst, &new).map_err(|e| {
+        std::fs::write(&dst, image).map_err(|e| {
             format!("write {}: {e} (if the driver is loaded, run uninstall or unload it first)", dst.display())
         })
     }
@@ -313,20 +358,13 @@ impl Host for WinHost {
     }
 
     fn start_driver(&self) -> Result<(), String> {
-        use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
-        use windows::Win32::System::Services::*;
-        let s = win::open(DRIVER_SERVICE, SERVICE_START)?.ok_or("driver service missing")?;
-        match unsafe { StartServiceW(s.svc, None) } {
-            Ok(()) => Ok(()),
-            Err(e) if e.code() == ERROR_SERVICE_ALREADY_RUNNING.to_hresult() => Ok(()),
-            Err(e) => Err(format!("start {DRIVER_SERVICE}: {e}")),
-        }
+        start_service(DRIVER_SERVICE)
     }
 
     fn ensure_own_service(&self, exe: &Path) -> Result<(), String> {
         use windows::core::PCWSTR;
         use windows::Win32::System::Services::*;
-        let bin = win::wide(&format!("\"{}\"", exe.display()));
+        let bin = win::wide(&format!("\"{}\" {SERVICE_ARG}", exe.display()));
         if let Some(s) = win::open(OWN_SERVICE, SERVICE_CHANGE_CONFIG)? {
             return unsafe {
                 ChangeServiceConfigW(
@@ -433,7 +471,7 @@ mod tests {
         }
     }
     impl Host for Mock {
-        fn copy_driver(&self, _src: &Path) -> Result<(), String> { self.call("copy") }
+        fn copy_driver(&self, _image: &[u8]) -> Result<(), String> { self.call("copy") }
         fn ensure_driver_service(&self) -> Result<(), String> { self.call("driver_svc") }
         fn start_driver(&self) -> Result<(), String> { self.call("start_driver") }
         fn ensure_own_service(&self, _exe: &Path) -> Result<(), String> { self.call("own_svc") }
@@ -454,35 +492,30 @@ mod tests {
     }
 
     #[test]
-    fn validate_rejects_non_sys_and_non_pe() {
+    fn override_rejects_non_sys_and_non_pe() {
         let d = tempfile::tempdir().unwrap();
-        assert!(validate_driver_source(&driver_file(&d, "a.dll", b"MZ..")).is_err());
-        assert!(validate_driver_source(&driver_file(&d, "a.sys", b"PK..")).is_err());
-        assert!(validate_driver_source(&d.path().join("missing.sys")).is_err());
-        assert!(validate_driver_source(&driver_file(&d, "netrbin.SYS", b"MZ\x90\x00")).is_ok());
+        assert!(read_driver_override(&driver_file(&d, "a.dll", b"MZ..")).is_err());
+        assert!(read_driver_override(&driver_file(&d, "a.sys", b"PK..")).is_err());
+        assert!(read_driver_override(&d.path().join("missing.sys")).is_err());
+        assert_eq!(read_driver_override(&driver_file(&d, "netrbin.SYS", b"MZ\x90\x00")).unwrap(), b"MZ\x90\x00");
+    }
+
+    #[test]
+    fn embedded_driver_is_a_pe_image() {
+        assert!(EMBEDDED_DRIVER.starts_with(b"MZ"));
     }
 
     #[test]
     fn install_runs_steps_in_order() {
-        let d = tempfile::tempdir().unwrap();
         let m = Mock::default();
-        install(&m, &driver_file(&d, "netrbin.sys", b"MZ"), Path::new(r"C:\x\rnetrbin-svc.exe")).unwrap();
+        install(&m, EMBEDDED_DRIVER, Path::new(r"C:\x\rnetrbin-svc.exe")).unwrap();
         assert_eq!(m.log(), ["copy", "driver_svc", "start_driver", "own_svc"]);
     }
 
     #[test]
-    fn install_bad_source_touches_nothing() {
-        let d = tempfile::tempdir().unwrap();
-        let m = Mock::default();
-        assert!(install(&m, &driver_file(&d, "netrbin.sys", b"xx"), Path::new("x.exe")).is_err());
-        assert!(m.log().is_empty());
-    }
-
-    #[test]
     fn install_stops_at_first_failure() {
-        let d = tempfile::tempdir().unwrap();
         let m = Mock { fail: Some("start_driver"), ..Default::default() };
-        let e = install(&m, &driver_file(&d, "netrbin.sys", b"MZ"), Path::new("x.exe")).unwrap_err();
+        let e = install(&m, EMBEDDED_DRIVER, Path::new("x.exe")).unwrap_err();
         assert!(e.to_string().starts_with("load driver"));
         assert_eq!(m.log(), ["copy", "driver_svc", "start_driver"]);
     }

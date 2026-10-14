@@ -4,9 +4,9 @@ Status: PENDING. Never run on a production workstation: the port is single-clien
 
 ## VM setup
 Two topologies; run the cases on both when possible.
-- **Standalone (target):** the original product is NOT installed. Copy `netrbin.sys`
-  from a licensed install, write the config, then from an elevated prompt:
-  `rnetrbin-svc.exe install --driver <path>\netrbin.sys` and `sc.exe start rnetrbin-svc`.
+- **Standalone (target):** the original product is NOT installed. The driver is
+  embedded in the exe at build time; write the config, then from an elevated prompt:
+  `rnetrbin-svc.exe install` and `sc.exe start rnetrbin-svc`.
 - **Coexisting:** original product installed (`SNetRBin` present); `install` reuses the
   driver and the service takes over SNetRBin at start.
 - A data volume plus an SMB share on it.
