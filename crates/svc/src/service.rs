@@ -514,9 +514,10 @@ pub struct WinDriver {
 
 impl WinDriver {
     pub fn new(cfg: &Config) -> Self {
+        let (includes, excludes) = crate::config::driver_masks(cfg);
         WinDriver {
-            includes: cfg.includes.clone(),
-            excludes: cfg.excludes.clone(),
+            includes,
+            excludes,
             log_dir: cfg.recycle_dir.to_string_lossy().into_owned(),
             port: None,
         }
@@ -840,7 +841,7 @@ mod tests {
         Config {
             recycle_dir: dir.join("recycle"),
             db_path: db,
-            includes: vec!["*".into()],
+            folders: vec![dir.to_path_buf()],
             excludes: vec![],
             max_bin_bytes: u64::MAX,
             max_age_days: None,
@@ -1214,7 +1215,7 @@ mod tests_round3 {
         Config {
             recycle_dir: dir.join("recycle"),
             db_path: dir.join("db.sqlite"),
-            includes: vec!["*".into()],
+            folders: vec![dir.to_path_buf()],
             excludes: vec![],
             max_bin_bytes: u64::MAX,
             max_age_days: None,

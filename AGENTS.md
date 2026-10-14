@@ -8,13 +8,16 @@ que instala e conversa com o minifilter de terceiro `netrbin.sys` (do produto
 
 ## Como rodar
 
-- build: `cargo build --release` -> `target/release/rnetrbin-svc.exe`
+- build: `cargo build --release` -> `target/release/rnetrbin-svc.exe` (embute o driver;
+  exige `driver/netrbin.sys` ou `RNETRBIN_DRIVER`, copiado de `C:\Windows\System32\drivers`)
 - testes: `cargo test` (unitarios, sem driver/SCM) e `cargo clippy --all-targets`
 - testes com driver: `cargo test -p rnetrbin-svc --test port_live -- --ignored` (so VM)
 - instalar (admin): config em `C:\ProgramData\rnetrbin\config.toml` (ver
-  `config.example.toml`), depois `rnetrbin-svc.exe install --driver <netrbin.sys>`
+  `config.example.toml`), depois `rnetrbin-svc.exe install` (`--driver <sys>` sobrescreve o embutido)
   e `sc.exe start rnetrbin-svc`; remover com `uninstall [--keep-driver]`
-- console: `--console` (sem tocar SCM) ou `--console --takeover`
+- janela: abrir o exe sem argumentos (pede UAC); lixeira (buscar/restaurar/excluir),
+  configuracoes, instalar/iniciar/parar. O SCM roda o exe com `--service`
+- console: `--console` (sem tocar SCM) ou `--console --takeover` (sempre 1o argumento)
 
 ## Convencoes que nao se deduzem do codigo
 
@@ -28,11 +31,14 @@ que instala e conversa com o minifilter de terceiro `netrbin.sys` (do produto
 ## Armadilhas
 
 - `netrbin.sys` nunca vai para o git (`*.sys` no .gitignore): binario de terceiro.
+  O build falha sem ele (build.rs); o exe gerado nao pode ser publicado.
 - Porta do driver aceita UM cliente: com SNetRBin rodando, nada conecta.
 - Desinstalar o produto original apaga o driver junto.
 - Assinatura do driver e cross-signed de 2015 (expirou 2016): pode ser bloqueada
   com HVCI (Windows 11 / Server 2022).
-- Protocolo e layout de paths ainda nao confirmados em runtime; ver `docs/notes/`.
+- Mascaras do driver casam com o caminho DOS completo, em MAIUSCULAS
+  (`FsRtlIsNameInExpression` IgnoreCase): use `config::driver_masks`, nunca a
+  mascara crua. Layout de paths da copia ainda nao confirmado em runtime.
 
 ## Tarefa, branch e commit
 

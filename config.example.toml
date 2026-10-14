@@ -1,5 +1,5 @@
-# Copy to C:\ProgramData\rnetrbin\config.toml (path is fixed in the binary).
-# Paths must be drive-absolute (X:\...); UNC paths and drive roots are rejected.
+# Copy to C:\ProgramData\rnetrbin\config.toml (path is fixed in the binary), or
+# let the GUI write it. Paths must be drive-absolute (X:\...); UNC paths are rejected.
 
 # Where the driver writes captured files. Must be empty or already contain the
 # .rnetrbin-root marker; the service creates the marker on first run.
@@ -8,7 +8,12 @@ recycle_dir = 'D:\RecycleBinNet'
 # SQLite index of deleted files. Must NOT be inside recycle_dir.
 db_path = 'C:\ProgramData\rnetrbin\index.db'
 
-includes = ["*.*"]
+# Protected folders, subfolders included (a drive root like 'E:\' protects the
+# whole volume). Only deletes inside them go to the bin.
+folders = ['D:\Dados']
+
+# File names never kept; a mask with a backslash matches the full path instead.
+# The recycle dir and the db are always excluded.
 excludes = ["*.tmp", "~$*"]
 
 # Quota: oldest non-restored backups are evicted above this size (bytes).
