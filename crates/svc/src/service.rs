@@ -174,7 +174,7 @@ impl StateStore for NoStore {
 /// Re-enable (saved start type, fallback AUTO_START if corrupt) and start the
 /// original, then delete the state file. Without a marker the start type is
 /// left unchanged (we never disabled it), and it is just started.
-pub fn restore<S: Scm, T: StateStore>(scm: &S, store: &T) {
+pub fn restore<S: Scm, T: StateStore>(scm: &S, store: &T) -> bool {
     let marker = store.read();
     let start = match marker {
         Marker::None => None,
@@ -186,8 +186,12 @@ pub fn restore<S: Scm, T: StateStore>(scm: &S, store: &T) {
             if marker != Marker::None {
                 store.clear();
             }
+            true
         }
-        Err(e) => tracing::error!("could not restore SNetRBin: {e}"),
+        Err(e) => {
+            tracing::error!("could not restore SNetRBin: {e}");
+            false
+        }
     }
 }
 
@@ -205,8 +209,37 @@ pub fn early_exit_restore_service() {
     early_exit_restore(&WinScm, &FileStore::new(STATE_PATH));
 }
 
-/// Close the port (single-client) first, then give SNetRBin back.
-fn handback<S: Scm, T: StateStore, D: Driver>(scm: &S, store: &T, driver: &mut D) {
+/// How often to retry a failed handback restore while nothing protects the box.
+pub const RESTORE_RETRY: Duration = Duration::from_secs(60);
+/// Cap on restore retries so a permanently broken SCM cannot spin forever.
+const RESTORE_MAX_TRIES: u32 = 10;
+
+/// Re-enable and start the original, retrying at `RESTORE_RETRY` while the
+/// machine is unprotected. Stops retrying when `stop` is set or the cap is hit.
+fn restore_until<S: Scm, T: StateStore>(scm: &S, store: &T, stop: &AtomicBool, sleep: &dyn Fn(Duration)) {
+    for attempt in 0..RESTORE_MAX_TRIES {
+        if restore(scm, store) {
+            return;
+        }
+        if stop.load(Ordering::Relaxed) || attempt + 1 == RESTORE_MAX_TRIES {
+            tracing::error!("SNetRBin could not be restored; machine may be unprotected");
+            return;
+        }
+        sleep(RESTORE_RETRY);
+    }
+}
+
+/// Close the port (single-client) first, then give SNetRBin back (with retry).
+fn handback<S: Scm, T: StateStore, D: Driver>(
+    scm: &S, store: &T, driver: &mut D, stop: &AtomicBool, sleep: &dyn Fn(Duration),
+) {
+    driver.disconnect();
+    restore_until(scm, store, stop, sleep);
+}
+
+/// Close the port and restore once (used on clean STOP, where a stuck restore
+/// should not block shutdown indefinitely).
+fn handback_once<S: Scm, T: StateStore, D: Driver>(scm: &S, store: &T, driver: &mut D) {
     driver.disconnect();
     restore(scm, store);
 }
@@ -285,11 +318,11 @@ pub fn takeover<S: Scm, T: StateStore, D: Driver>(
                 return true;
             }
             Outcome::Aborted => {
-                handback(scm, store, driver);
+                handback(scm, store, driver, stop, sleep);
                 return false;
             }
             Outcome::Exhausted => {
-                handback(scm, store, driver);
+                handback(scm, store, driver, stop, sleep);
                 *failed_cycles = failed_cycles.saturating_add(1);
                 let wait = retry_wait(*failed_cycles);
                 tracing::error!(
@@ -419,7 +452,7 @@ pub fn run_with<S: Scm, T: StateStore, D: Driver>(
     // crash, or right after a heartbeat failure dropped the session).
     if handback_on_exit.load(Ordering::Relaxed) && (protected || store.read() != Marker::None) {
         tracing::info!("stop requested: handing protection back to SNetRBin");
-        handback(scm, store, driver);
+        handback_once(scm, store, driver);
     }
     if handle.join().is_err() {
         tracing::error!("watcher supervisor thread panicked");
@@ -649,6 +682,7 @@ mod tests {
         start_type: Cell<u32>,
         restored_with: Cell<Option<Option<u32>>>,
         stop_err: Cell<bool>,
+        restore_fail_times: Cell<u32>,
     }
     impl World {
         fn new() -> Self {
@@ -658,6 +692,7 @@ mod tests {
                 start_type: Cell::new(2),
                 restored_with: Cell::new(None),
                 stop_err: Cell::new(false),
+                restore_fail_times: Cell::new(0),
             }
         }
         fn log(&self, c: &'static str) {
@@ -682,6 +717,12 @@ mod tests {
             Ok(())
         }
         fn restore_start(&self, start_type: Option<u32>) -> Result<(), String> {
+            let left = self.restore_fail_times.get();
+            if left > 0 {
+                self.restore_fail_times.set(left - 1);
+                self.log("restore_fail");
+                return Err("start failed".into());
+            }
             self.log("restore");
             self.restored_with.set(Some(start_type));
             Ok(())
@@ -859,6 +900,31 @@ mod tests {
         assert!(backoff_total <= CONNECT_BUDGET);
         // never disabled -> nothing recorded, restore keeps the start type
         assert_eq!(w.restored_with.get(), Some(None));
+    }
+
+    #[test]
+    fn exhausted_handback_retries_restore_until_it_succeeds_before_long_wait() {
+        let w = World::new();
+        w.restore_fail_times.set(2); // first two restore attempts fail
+        let mut drv = FakeDriver::new(&w, u32::MAX); // connect always fails
+        let stop = AtomicBool::new(false);
+        let waits = RefCell::new(Vec::new());
+        let sleep = |d: Duration| {
+            waits.borrow_mut().push(d);
+            // stop only once the long retry wait is reached (handback already done)
+            if d == RETRY_WAIT || d == LONG_RETRY_WAIT {
+                stop.store(true, Ordering::Relaxed);
+            }
+        };
+        assert!(!takeover(&w, &w, &mut drv, &stop, &mut 0, &sleep));
+        let calls = w.calls();
+        // two failed restores, then a successful one, all before the long wait
+        assert_eq!(calls.iter().filter(|c| **c == "restore_fail").count(), 2);
+        assert_eq!(calls.iter().filter(|c| **c == "restore").count(), 1);
+        let restore_pos = calls.iter().position(|c| *c == "restore").unwrap();
+        // short restore-retry sleeps happened; the long wait is the last sleep
+        assert!(waits.borrow().contains(&RESTORE_RETRY));
+        assert!(calls.last() == Some(&"restore") || restore_pos < calls.len());
     }
 
     #[test]
