@@ -231,11 +231,17 @@ fn disable_with_state<S: Scm, T: StateStore>(scm: &S, store: &T) {
 /// Transactional takeover. Returns true when we hold the driver port (and the
 /// original is disabled with a state record); false if stop was requested.
 /// Every non-success exit after stopping the original hands it back.
+///
+/// `failed_cycles` is owned by the caller and survives across calls: a
+/// successful connect does NOT reset it (a session that dies right after
+/// connecting must still escalate). The caller resets it once a heartbeat
+/// proves the session is healthy.
 pub fn takeover<S: Scm, T: StateStore, D: Driver>(
     scm: &S,
     store: &T,
     driver: &mut D,
     stop: &AtomicBool,
+    failed_cycles: &mut u32,
     sleep: &dyn Fn(Duration),
 ) -> bool {
     enum Outcome {
@@ -243,7 +249,6 @@ pub fn takeover<S: Scm, T: StateStore, D: Driver>(
         Aborted,
         Exhausted,
     }
-    let mut failed_cycles: u32 = 0;
     loop {
         if stop.load(Ordering::Relaxed) {
             return false;
@@ -283,8 +288,8 @@ pub fn takeover<S: Scm, T: StateStore, D: Driver>(
             }
             Outcome::Exhausted => {
                 handback(scm, store, driver);
-                failed_cycles = failed_cycles.saturating_add(1);
-                let wait = retry_wait(failed_cycles);
+                *failed_cycles = failed_cycles.saturating_add(1);
+                let wait = retry_wait(*failed_cycles);
                 tracing::error!(
                     "takeover failed; original SNetRBin restored; will retry in {} min",
                     wait.as_secs() / 60
@@ -374,10 +379,11 @@ pub fn run_with<S: Scm, T: StateStore, D: Driver>(
     let handle = spawn_watcher_supervisor(idx.clone(), cfg.recycle_dir.clone(), stop.clone());
 
     let mut protected = false;
+    let mut failed_cycles: u32 = 0;
     let mut since_hb = Duration::ZERO;
     while !stop.load(Ordering::Relaxed) {
         if !protected {
-            protected = takeover(scm, store, driver, &stop, sleep);
+            protected = takeover(scm, store, driver, &stop, &mut failed_cycles, sleep);
             since_hb = Duration::ZERO;
             if !protected {
                 break;
@@ -395,12 +401,19 @@ pub fn run_with<S: Scm, T: StateStore, D: Driver>(
         since_hb += TICK;
         if !stop.load(Ordering::Relaxed) && since_hb >= HEARTBEAT_EVERY {
             since_hb = Duration::ZERO;
-            if !heartbeat(driver) {
+            if heartbeat(driver) {
+                // A session that survives a heartbeat is healthy.
+                failed_cycles = 0;
+            } else {
                 protected = false;
             }
         }
     }
-    if protected && handback_on_exit.load(Ordering::Relaxed) {
+    // Hand back on STOP whenever WE are the reason SNetRBin is down: either we
+    // hold the port now, or the state marker proves we disabled it earlier
+    // (STOP during prepare / before the first loop pass after a SHUTDOWN or
+    // crash, or right after a heartbeat failure dropped the session).
+    if handback_on_exit.load(Ordering::Relaxed) && (protected || store.read() != Marker::None) {
         tracing::info!("stop requested: handing protection back to SNetRBin");
         handback(scm, store, driver);
     }
@@ -691,10 +704,11 @@ mod tests {
         fail_after: u32,
         connects: u32,
         hb_err: bool,
+        stop_on_hb_err: Option<Arc<AtomicBool>>,
     }
     impl<'a> FakeDriver<'a> {
         fn new(w: &'a World, fail_first: u32) -> Self {
-            FakeDriver { w, fail_first, fail_after: u32::MAX, connects: 0, hb_err: false }
+            FakeDriver { w, fail_first, fail_after: u32::MAX, connects: 0, hb_err: false, stop_on_hb_err: None }
         }
     }
     impl Driver for FakeDriver<'_> {
@@ -708,7 +722,14 @@ mod tests {
             }
         }
         fn heartbeat(&mut self) -> Result<(), String> {
-            if self.hb_err { Err("gone".into()) } else { Ok(()) }
+            if self.hb_err {
+                if let Some(s) = &self.stop_on_hb_err {
+                    s.store(true, Ordering::Relaxed);
+                }
+                Err("gone".into())
+            } else {
+                Ok(())
+            }
         }
         fn disconnect(&mut self) {
             self.w.log("disconnect");
@@ -793,7 +814,7 @@ mod tests {
         let w = World::new();
         let mut drv = FakeDriver::new(&w, 2);
         let stop = AtomicBool::new(false);
-        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert!(takeover(&w, &w, &mut drv, &stop, &mut 0, &|_| {}));
         assert_eq!(
             w.calls(),
             vec!["stop", "configure", "configure", "configure", "query", "write_state", "disable"]
@@ -807,7 +828,7 @@ mod tests {
         w.start_type.set(START_DISABLED);
         let mut drv = FakeDriver::new(&w, 0);
         let stop = AtomicBool::new(false);
-        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert!(takeover(&w, &w, &mut drv, &stop, &mut 0, &|_| {}));
         assert!(!w.calls().contains(&"write_state"));
         assert_eq!(w.read(), Marker::None);
     }
@@ -824,7 +845,7 @@ mod tests {
                 stop.store(true, Ordering::Relaxed);
             }
         };
-        assert!(!takeover(&w, &w, &mut drv, &stop, &sleep));
+        assert!(!takeover(&w, &w, &mut drv, &stop, &mut 0, &sleep));
         let calls = w.calls();
         assert!(!calls.contains(&"disable"));
         assert_eq!(calls.first(), Some(&"stop"));
@@ -850,7 +871,7 @@ mod tests {
                 }
             }
         };
-        assert!(!takeover(&w, &w, &mut drv, &stop, &sleep));
+        assert!(!takeover(&w, &w, &mut drv, &stop, &mut 0, &sleep));
         assert_eq!(
             *waits.borrow(),
             vec![RETRY_WAIT, RETRY_WAIT, LONG_RETRY_WAIT, LONG_RETRY_WAIT, LONG_RETRY_WAIT]
@@ -863,7 +884,7 @@ mod tests {
         let mut drv = FakeDriver::new(&w, u32::MAX);
         let stop = AtomicBool::new(false);
         let sleep = |_d: Duration| stop.store(true, Ordering::Relaxed);
-        assert!(!takeover(&w, &w, &mut drv, &stop, &sleep));
+        assert!(!takeover(&w, &w, &mut drv, &stop, &mut 0, &sleep));
         let calls = w.calls();
         assert_eq!(calls.last(), Some(&"restore"));
         assert!(!calls.contains(&"disable"));
@@ -874,7 +895,7 @@ mod tests {
         let w = World::new();
         let mut drv = FakeDriver::new(&w, 0);
         let stop = AtomicBool::new(true);
-        assert!(!takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert!(!takeover(&w, &w, &mut drv, &stop, &mut 0, &|_| {}));
         assert!(w.calls().is_empty());
     }
 
@@ -884,7 +905,7 @@ mod tests {
         w.stop_err.set(true);
         let mut drv = FakeDriver::new(&w, 0);
         let stop = AtomicBool::new(false);
-        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert!(takeover(&w, &w, &mut drv, &stop, &mut 0, &|_| {}));
         assert_eq!(w.calls()[..2], ["stop", "configure"]);
         assert!(w.calls().contains(&"disable"));
     }
@@ -913,13 +934,13 @@ mod tests {
         let w = World::new();
         let mut drv = FakeDriver::new(&w, 0);
         let stop = AtomicBool::new(false);
-        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert!(takeover(&w, &w, &mut drv, &stop, &mut 0, &|_| {}));
         assert!(heartbeat(&mut drv));
         drv.hb_err = true;
         assert!(!heartbeat(&mut drv));
         assert_eq!(w.calls().iter().filter(|c| **c == "disconnect").count(), 1);
         drv.hb_err = false;
-        assert!(takeover(&w, &w, &mut drv, &stop, &|_| {}));
+        assert!(takeover(&w, &w, &mut drv, &stop, &mut 0, &|_| {}));
         assert_eq!(drv.connects, 2);
     }
 
@@ -1006,5 +1027,125 @@ mod tests {
         assert!(calls[d..].contains(&"restore"));
         assert_eq!(w.restored_with.get(), Some(Some(2)));
         assert_eq!(w.read(), Marker::None);
+    }
+}
+
+#[cfg(test)]
+mod tests_round3 {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    // Minimal local fakes (independent of the main test module).
+    struct W {
+        calls: RefCell<Vec<&'static str>>,
+        marker: RefCell<Marker>,
+        connects: Cell<u32>,
+        stop_on_hb: Option<Arc<AtomicBool>>,
+    }
+    impl W {
+        fn new(marker: Marker) -> Self {
+            W { calls: RefCell::new(vec![]), marker: RefCell::new(marker), connects: Cell::new(0), stop_on_hb: None }
+        }
+        fn log(&self, c: &'static str) {
+            self.calls.borrow_mut().push(c);
+        }
+    }
+    impl Scm for W {
+        fn stop_original(&self) -> Result<(), String> { self.log("stop"); Ok(()) }
+        fn query_start_type(&self) -> Result<Option<u32>, String> { Ok(Some(2)) }
+        fn disable_original(&self) -> Result<(), String> { self.log("disable"); Ok(()) }
+        fn restore_start(&self, _t: Option<u32>) -> Result<(), String> { self.log("restore"); Ok(()) }
+    }
+    impl StateStore for W {
+        fn read(&self) -> Marker { *self.marker.borrow() }
+        fn write(&self, t: u32) -> Result<(), String> { *self.marker.borrow_mut() = Marker::Saved(t); Ok(()) }
+        fn clear(&self) { self.log("clear_state"); *self.marker.borrow_mut() = Marker::None; }
+    }
+    struct D<'a> { w: &'a W, ok_connects: u32 }
+    impl Driver for D<'_> {
+        fn connect_and_configure(&mut self) -> Result<(), String> {
+            self.w.connects.set(self.w.connects.get() + 1);
+            if self.w.connects.get() <= self.ok_connects { Ok(()) } else { Err("down".into()) }
+        }
+        fn heartbeat(&mut self) -> Result<(), String> {
+            if let Some(s) = &self.w.stop_on_hb { s.store(true, Ordering::Relaxed); }
+            Err("gone".into())
+        }
+        fn disconnect(&mut self) { self.w.log("disconnect"); }
+    }
+    fn cfg(dir: &std::path::Path) -> Config {
+        Config {
+            recycle_dir: dir.join("recycle"),
+            db_path: dir.join("db.sqlite"),
+            includes: vec!["*".into()],
+            excludes: vec![],
+            max_bin_bytes: u64::MAX,
+            max_age_days: None,
+        }
+    }
+
+    #[test]
+    fn stop_before_loop_with_marker_still_hands_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = W::new(Marker::Saved(2));
+        let mut d = D { w: &w, ok_connects: 0 };
+        let stop = Arc::new(AtomicBool::new(true));
+        run_with(cfg(dir.path()), stop, &AtomicBool::new(true), &w, &w, &mut d, &|_| {}).unwrap();
+        assert_eq!(*w.calls.borrow(), vec!["disconnect", "restore", "clear_state"]);
+    }
+
+    #[test]
+    fn stop_before_loop_without_marker_or_handback_touches_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let w = W::new(Marker::None);
+        let mut d = D { w: &w, ok_connects: 0 };
+        let stop = Arc::new(AtomicBool::new(true));
+        run_with(cfg(dir.path()), stop.clone(), &AtomicBool::new(true), &w, &w, &mut d, &|_| {}).unwrap();
+        assert!(w.calls.borrow().is_empty(), "no marker: SCM must not be touched");
+        let w2 = W::new(Marker::Saved(2));
+        let mut d2 = D { w: &w2, ok_connects: 0 };
+        run_with(cfg(dir.path()), stop, &AtomicBool::new(false), &w2, &w2, &mut d2, &|_| {}).unwrap();
+        assert!(w2.calls.borrow().is_empty(), "SHUTDOWN must not restore");
+    }
+
+    #[test]
+    fn stop_after_heartbeat_failure_before_retakeover_restores() {
+        let dir = tempfile::tempdir().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut w = W::new(Marker::None);
+        w.stop_on_hb = Some(stop.clone());
+        let mut d = D { w: &w, ok_connects: 1 };
+        run_with(cfg(dir.path()), stop, &AtomicBool::new(true), &w, &w, &mut d, &|_| {}).unwrap();
+        let calls = w.calls.borrow();
+        let n = calls.len();
+        assert_eq!(calls[n - 3..], ["disconnect", "restore", "clear_state"]);
+        assert_eq!(w.connects.get(), 1, "no re-takeover attempted after STOP");
+    }
+
+    #[test]
+    fn takeover_success_does_not_reset_failure_counter() {
+        let w = W::new(Marker::None);
+        let mut d = D { w: &w, ok_connects: 1 };
+        let mut failed = 2u32;
+        assert!(takeover(&w, &w, &mut d, &AtomicBool::new(false), &mut failed, &|_| {}));
+        assert_eq!(failed, 2);
+    }
+
+    #[test]
+    fn carried_failure_counter_escalates_first_exhausted_cycle() {
+        let w = W::new(Marker::None);
+        let mut d = D { w: &w, ok_connects: 0 };
+        let stop = AtomicBool::new(false);
+        let waits = RefCell::new(vec![]);
+        let mut failed = 2u32;
+        let sleep = |dur: Duration| {
+            if dur >= RETRY_WAIT {
+                waits.borrow_mut().push(dur);
+                stop.store(true, Ordering::Relaxed);
+            }
+        };
+        assert!(!takeover(&w, &w, &mut d, &stop, &mut failed, &sleep));
+        assert_eq!(*waits.borrow(), vec![LONG_RETRY_WAIT]);
+        assert_eq!(failed, 3);
     }
 }

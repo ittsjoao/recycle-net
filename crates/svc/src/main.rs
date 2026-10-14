@@ -39,6 +39,9 @@ fn init_file_logging() {
     }
 }
 
+/// StopPending wait hint; must exceed the worst-case handback duration.
+const STOP_WAIT_HINT: Duration = Duration::from_secs(90);
+
 fn status(state: ServiceState, accept: ServiceControlAccept, code: u32, wait_hint: Duration) -> ServiceStatus {
     ServiceStatus {
         service_type: ServiceType::OWN_PROCESS,
@@ -70,7 +73,9 @@ fn run_as_service() -> Result<(), Box<dyn std::error::Error>> {
                     ServiceState::StopPending,
                     ServiceControlAccept::empty(),
                     0,
-                    Duration::from_secs(40),
+                    // Worst case handback: ~30s waiting for SNetRBin to stop
+                    // plus ~30s for StartServiceW, plus the watcher join.
+                    STOP_WAIT_HINT,
                 ));
             }
             ServiceControlHandlerResult::NoError
@@ -104,7 +109,17 @@ fn run_as_service() -> Result<(), Box<dyn std::error::Error>> {
 
 fn run_console(takeover: bool) -> Result<(), Box<dyn std::error::Error>> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
-    let cfg = Config::load(Path::new(CONFIG_PATH))?;
+    let cfg = match Config::load(Path::new(CONFIG_PATH)) {
+        Ok(c) => c,
+        Err(e) => {
+            // Same early-exit rule as service mode, but only when this run is
+            // allowed to touch the SCM at all.
+            if takeover {
+                service::early_exit_restore_service();
+            }
+            return Err(e.into());
+        }
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let handback = Arc::new(AtomicBool::new(false));
     let (c_stop, c_hand) = (stop.clone(), handback.clone());
