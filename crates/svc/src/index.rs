@@ -25,7 +25,7 @@ impl Index {
         conn.execute_batch(SCHEMA)?;
         Ok(Index { conn })
     }
-    // Not cfg(test): integration tests and other modules' tests need it.
+    #[cfg(test)]
     pub fn open_memory() -> rusqlite::Result<Index> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(SCHEMA)?;
