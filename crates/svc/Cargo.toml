@@ -30,6 +30,8 @@ features = [
   "Win32_Storage_InstallableFileSystems",
   "Win32_System_Services",
   "Win32_Security",
+  "Win32_System_Registry",
+  "Win32_Storage_FileSystem",
 ]
 
 [dev-dependencies]

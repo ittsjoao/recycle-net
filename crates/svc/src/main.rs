@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rnetrbin_svc::{config::Config, service};
+use rnetrbin_svc::{config::Config, install, service};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
@@ -137,8 +137,47 @@ fn run_console(takeover: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// `install --driver <netrbin.sys>`: the config must already be valid, so the
+/// service never starts against a config it would reject.
+fn run_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+    let driver = args
+        .iter()
+        .position(|a| a == "--driver")
+        .and_then(|i| args.get(i + 1))
+        .ok_or("usage: rnetrbin-svc install --driver <path\\to\\netrbin.sys>")?;
+    Config::load(Path::new(CONFIG_PATH)).map_err(|e| format!("config {CONFIG_PATH}: {e}"))?;
+    let exe = std::env::current_exe()?;
+    install::install(&install::WinHost, Path::new(driver), &exe)?;
+    println!("installed; start with: sc.exe start {SERVICE_NAME}");
+    Ok(())
+}
+
+fn run_uninstall(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+    let keep = args.iter().any(|a| a == "--keep-driver");
+    match install::uninstall(&install::WinHost, keep)? {
+        install::Uninstalled::DriverKept => println!("service removed; netrbin driver kept"),
+        install::Uninstalled::DriverRemoved => println!("service and netrbin driver removed"),
+        install::Uninstalled::RebootRequired => println!("service removed; reboot to finish removing the driver"),
+    }
+    Ok(())
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    let sub = match args.get(1).map(String::as_str) {
+        Some("install") => Some(run_install(&args)),
+        Some("uninstall") => Some(run_uninstall(&args)),
+        _ => None,
+    };
+    if let Some(res) = sub {
+        if let Err(e) = res {
+            eprintln!("error: {e}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if args.iter().any(|a| a == "--console") {
         let takeover = args.iter().any(|a| a == "--takeover");
         if let Err(e) = run_console(takeover) {

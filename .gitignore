@@ -1,3 +1,5 @@
 target/
 Cargo.lock
 .superpowers/
+# third-party driver binary: never commit (license)
+*.sys

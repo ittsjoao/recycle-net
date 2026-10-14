@@ -7,3 +7,4 @@ pub mod watcher;
 pub mod retention;
 pub mod restore;
 pub mod service;
+pub mod install;
