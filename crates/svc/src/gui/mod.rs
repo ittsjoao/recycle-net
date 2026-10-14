@@ -1,5 +1,550 @@
-//! Desktop window (iced). Rebuilt in Undelete style; see the spec of 2026-10-14.
+//! Desktop window (iced), Undelete style: ribbon tabs, bin tree, folder listing.
+mod folders;
+mod home;
+mod settings;
 pub mod icons;
 pub mod listing;
 pub mod theme;
 pub mod tree;
+use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use iced::widget::{column, container, row, text, Space};
+use iced::{keyboard, Alignment, Element, Length, Subscription, Task, Theme};
+
+use crate::audit::setup::{self as audit_setup, AuditStatus};
+use crate::config::{Config, FolderRule, ThemeName, CONFIG_PATH};
+use crate::index::{Index, Version};
+use crate::install::{self, SvcState};
+use listing::{Listing, SortCol, View};
+use tree::Tree;
+
+/// Files shown at once in the list; refine the search to see more.
+const MAX_ROWS: usize = 1000;
+
+pub fn run() -> iced::Result {
+    iced::application(App::new, App::update, App::view)
+        .title(App::title)
+        .theme(App::theme)
+        .subscription(App::subscription)
+        .font(icons::FONT_BYTES)
+        .window_size((1150.0, 720.0))
+        .run()
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tab {
+    Arquivo,
+    Inicio,
+    Pastas,
+    Config,
+}
+
+#[derive(Debug, Clone)]
+pub enum Msg {
+    Tab(Tab),
+    Modifiers(keyboard::Modifiers),
+    // Início
+    Search(String),
+    Go(String),
+    ToggleNode(String),
+    Click(i64),
+    Sort(SortCol),
+    AllCopies(bool),
+    ShowCopies,
+    CloseCopies,
+    Restore,
+    RestoreTo,
+    Purge,
+    Refresh,
+    // Pastas protegidas
+    SelectFolder(usize),
+    AddFolder,
+    EditRules,
+    RuleInclude(String),
+    RuleExclude(String),
+    RuleSave,
+    RuleCancel,
+    RemoveFolder,
+    ConfirmRemove,
+    // Configurações
+    Field(settings::Field, String),
+    Theme(ThemeName),
+    Save,
+    Install,
+    Start,
+    Stop,
+    // Arquivo
+    Exit,
+    Done(Result<String, String>),
+}
+
+pub struct App {
+    tab: Tab,
+    theme: ThemeName,
+    form: settings::Form,
+    folders: Vec<FolderRule>,
+    folder_sel: Option<usize>,
+    rule_edit: Option<folders::RuleEdit>,
+    confirm_remove: bool,
+    idx: Option<Arc<Index>>,
+    rows: Vec<Version>,
+    tree: Tree,
+    listing: Listing,
+    cur: String,
+    expanded: BTreeSet<String>,
+    query: String,
+    all_copies: bool,
+    copies_of: Option<String>,
+    sort: (SortCol, bool),
+    selected: BTreeSet<i64>,
+    anchor: Option<i64>,
+    mods: keyboard::Modifiers,
+    svc: SvcState,
+    driver: SvcState,
+    audit: AuditStatus,
+    status: String,
+    busy: bool,
+}
+
+/// Run blocking work off the UI thread and report its outcome.
+fn work(f: impl FnOnce() -> Result<String, String> + Send + 'static) -> Task<Msg> {
+    Task::perform(async move { f() }, Msg::Done)
+}
+
+fn open_index(db: &Path) -> Result<Arc<Index>, String> {
+    if let Some(parent) = db.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    Index::open(db).map(Arc::new).map_err(|e| format!("Não abriu o índice {}: {e}", db.display()))
+}
+
+fn summary(verb: &str, n: usize, errs: Vec<String>) -> Result<String, String> {
+    if errs.is_empty() {
+        Ok(format!("{n} {verb}."))
+    } else {
+        Err(format!("{} de {n} falharam: {}", errs.len(), errs.join("; ")))
+    }
+}
+
+impl App {
+    fn new() -> (App, Task<Msg>) {
+        let mut app = App {
+            tab: Tab::Inicio,
+            theme: ThemeName::default(),
+            form: settings::Form::from_config(&Config::default()),
+            folders: Vec::new(),
+            folder_sel: None,
+            rule_edit: None,
+            confirm_remove: false,
+            idx: None,
+            rows: Vec::new(),
+            tree: Tree::default(),
+            listing: Listing::default(),
+            cur: String::new(),
+            expanded: BTreeSet::from([String::new()]),
+            query: String::new(),
+            all_copies: true,
+            copies_of: None,
+            sort: (SortCol::Deleted, false),
+            selected: BTreeSet::new(),
+            anchor: None,
+            mods: keyboard::Modifiers::default(),
+            svc: SvcState::NotInstalled,
+            driver: SvcState::NotInstalled,
+            audit: AuditStatus::default(),
+            status: String::new(),
+            busy: false,
+        };
+        match Config::load(Path::new(CONFIG_PATH)) {
+            Ok(c) => app.apply_config(&c),
+            Err(e) => {
+                app.status = if Path::new(CONFIG_PATH).exists() {
+                    format!("Configuração inválida ({e}); corrija em Configurações.")
+                } else {
+                    "Primeiro uso: adicione as pastas em Pastas protegidas e instale em Configurações.".into()
+                };
+            }
+        }
+        app.refresh();
+        if app.svc == SvcState::NotInstalled {
+            app.tab = Tab::Config;
+        }
+        (app, Task::none())
+    }
+
+    fn title(&self) -> String {
+        let host = std::env::var("COMPUTERNAME").unwrap_or_default();
+        format!("rnetrbin - Lixeira de rede - {host}")
+    }
+
+    fn theme(&self) -> Theme {
+        theme::iced_theme(self.theme)
+    }
+
+    fn subscription(&self) -> Subscription<Msg> {
+        iced::event::listen_with(|event, _status, _window| match event {
+            iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => Some(Msg::Modifiers(m)),
+            _ => None,
+        })
+    }
+
+    fn pal(&self) -> theme::Pal {
+        theme::pal(self.theme)
+    }
+
+    fn apply_config(&mut self, c: &Config) {
+        self.theme = c.theme;
+        self.form = settings::Form::from_config(c);
+        self.folders = c.folders.clone();
+        match open_index(&c.db_path) {
+            Ok(i) => self.idx = Some(i),
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Re-read service state, audit state and the whole index.
+    fn refresh(&mut self) {
+        self.svc = install::service_state(install::OWN_SERVICE).unwrap_or(SvcState::NotInstalled);
+        self.driver = install::service_state(install::DRIVER_SERVICE).unwrap_or(SvcState::NotInstalled);
+        self.audit = audit_setup::status();
+        if let Some(idx) = &self.idx {
+            match idx.all_versions() {
+                Ok(v) => self.rows = v,
+                Err(e) => self.status = format!("Erro ao ler o índice: {e}"),
+            }
+        }
+        let roots: Vec<String> = self.folders.iter().map(|f| f.path.display().to_string()).collect();
+        let files: Vec<(String, i64, i64)> =
+            self.rows.iter().map(|r| (r.original_path.clone(), r.size, r.deleted_utc)).collect();
+        self.tree = Tree::build(&roots, &files);
+        self.relist();
+    }
+
+    /// Recompute the list from the loaded rows (no disk access).
+    fn relist(&mut self) {
+        self.listing = listing::build(
+            &self.tree,
+            &self.rows,
+            &View {
+                cur: &self.cur,
+                query: &self.query,
+                all_copies: self.all_copies,
+                copies_of: self.copies_of.as_deref(),
+                sort: self.sort,
+                limit: MAX_ROWS,
+            },
+        );
+        let visible: BTreeSet<i64> = self.listing.files.iter().map(|f| f.id).collect();
+        self.selected.retain(|id| visible.contains(id));
+    }
+
+    /// Navigate to a folder and open its branch in the tree.
+    fn go(&mut self, path: String) {
+        let mut p = path.clone();
+        loop {
+            self.expanded.insert(tree::key(&p));
+            if p.is_empty() || self.tree.is_root(&p) {
+                break;
+            }
+            p = tree::parent(&p).to_string();
+        }
+        self.expanded.insert(String::new());
+        self.cur = path;
+        self.query.clear();
+        self.copies_of = None;
+        self.selected.clear();
+        self.anchor = None;
+        self.relist();
+    }
+
+    fn click(&mut self, id: i64) {
+        if self.mods.control() {
+            if !self.selected.remove(&id) {
+                self.selected.insert(id);
+            }
+            self.anchor = Some(id);
+        } else if self.mods.shift() && self.anchor.is_some() {
+            let pos = |x: i64| self.listing.files.iter().position(|f| f.id == x);
+            if let (Some(a), Some(b)) = (pos(self.anchor.unwrap_or(id)), pos(id)) {
+                let (lo, hi) = (a.min(b), a.max(b));
+                self.selected = self.listing.files[lo..=hi].iter().map(|f| f.id).collect();
+            }
+        } else {
+            self.selected = BTreeSet::from([id]);
+            self.anchor = Some(id);
+        }
+    }
+
+    fn selected_versions(&self) -> Vec<Version> {
+        self.listing.files.iter().filter(|f| self.selected.contains(&f.id)).cloned().collect()
+    }
+
+    /// Validate and write the config; restart the service if it is running.
+    fn save_config(&mut self) -> Task<Msg> {
+        let mut cfg = match self.form.to_config(&self.folders, self.theme) {
+            Ok(c) => c,
+            Err(e) => {
+                self.status = e;
+                return Task::none();
+            }
+        };
+        if let Err(e) = cfg.save(Path::new(CONFIG_PATH)) {
+            self.status = format!("Não salvou: {e}");
+            return Task::none();
+        }
+        self.apply_config(&cfg);
+        if self.svc != SvcState::Running {
+            self.status = "Configuração salva.".into();
+            self.refresh();
+            return Task::none();
+        }
+        self.busy = true;
+        work(|| {
+            install::stop_own_service()?;
+            install::start_service(install::OWN_SERVICE)?;
+            Ok("Configuração salva; serviço reiniciado.".into())
+        })
+    }
+
+    fn restore(&mut self, dir: Option<PathBuf>) -> Task<Msg> {
+        let Some(idx) = self.idx.clone() else { return Task::none() };
+        let items = self.selected_versions();
+        self.busy = true;
+        work(move || {
+            let mut errs = Vec::new();
+            for v in &items {
+                let dest = dir.as_ref().map(|d| d.join(listing::split_path(&v.original_path).0));
+                let r = match &dest {
+                    // restore() with an override copies over the target; never clobber here.
+                    Some(d) if d.exists() => Err(format!("{} já existe", d.display())),
+                    _ => crate::restore::restore(&idx, v.id, dest.as_deref()).map(|_| ()).map_err(|e| match e {
+                        crate::restore::RestoreError::Exists => {
+                            format!("{} já existe no local original; use \"Restaurar em...\"", v.original_path)
+                        }
+                        e => format!("{}: {e}", v.original_path),
+                    }),
+                };
+                if let Err(e) = r {
+                    errs.push(e);
+                }
+            }
+            summary("restaurado(s)", items.len(), errs)
+        })
+    }
+
+    fn update(&mut self, msg: Msg) -> Task<Msg> {
+        if !matches!(msg, Msg::ConfirmRemove | Msg::Modifiers(_)) {
+            self.confirm_remove = false;
+        }
+        match msg {
+            Msg::Tab(t) => self.tab = t,
+            Msg::Modifiers(m) => self.mods = m,
+            Msg::Search(q) => {
+                self.query = q;
+                self.copies_of = None;
+                self.relist();
+            }
+            Msg::Go(p) => self.go(p),
+            Msg::ToggleNode(p) => {
+                let k = tree::key(&p);
+                if !self.expanded.remove(&k) {
+                    self.expanded.insert(k);
+                }
+            }
+            Msg::Click(id) => self.click(id),
+            Msg::Sort(col) => {
+                self.sort = if self.sort.0 == col {
+                    (col, !self.sort.1)
+                } else {
+                    (col, matches!(col, SortCol::Name | SortCol::User))
+                };
+                self.relist();
+            }
+            Msg::AllCopies(on) => {
+                self.all_copies = on;
+                self.relist();
+            }
+            Msg::ShowCopies => {
+                if let Some(v) = self.selected_versions().first() {
+                    self.copies_of = Some(v.original_path.clone());
+                    self.selected.clear();
+                    self.relist();
+                }
+            }
+            Msg::CloseCopies => {
+                self.copies_of = None;
+                self.relist();
+            }
+            Msg::Restore => return self.restore(None),
+            Msg::RestoreTo => {
+                if let Some(dir) = rfd::FileDialog::new().set_title("Restaurar em").pick_folder() {
+                    return self.restore(Some(dir));
+                }
+            }
+            Msg::Purge => {
+                let Some(idx) = self.idx.clone() else { return Task::none() };
+                let ids: Vec<i64> = self.selected.iter().copied().collect();
+                self.busy = true;
+                return work(move || {
+                    let errs: Vec<String> = ids
+                        .iter()
+                        .filter_map(|id| crate::retention::purge(&idx, *id).err().map(|e| format!("#{id}: {e}")))
+                        .collect();
+                    summary("excluído(s) de vez", ids.len(), errs)
+                });
+            }
+            Msg::Refresh => {
+                self.refresh();
+                self.status = "Lista atualizada.".into();
+            }
+            Msg::SelectFolder(i) => self.folder_sel = Some(i),
+            Msg::AddFolder => {
+                if let Some(dir) = rfd::FileDialog::new().set_title("Pasta a proteger").pick_folder() {
+                    self.rule_edit = Some(folders::RuleEdit::new(None, &FolderRule::with_defaults(dir)));
+                }
+            }
+            Msg::EditRules => {
+                if let Some(i) = self.folder_sel {
+                    self.rule_edit = Some(folders::RuleEdit::new(Some(i), &self.folders[i]));
+                }
+            }
+            Msg::RuleInclude(s) => {
+                if let Some(r) = &mut self.rule_edit {
+                    r.include = s;
+                }
+            }
+            Msg::RuleExclude(s) => {
+                if let Some(r) = &mut self.rule_edit {
+                    r.exclude = s;
+                }
+            }
+            Msg::RuleCancel => self.rule_edit = None,
+            Msg::RuleSave => {
+                let Some(edit) = self.rule_edit.take() else { return Task::none() };
+                let before = self.folders.clone();
+                let rule = edit.to_rule();
+                match edit.index {
+                    Some(i) => self.folders[i] = rule,
+                    None => self.folders.push(rule),
+                }
+                let task = self.save_config();
+                if self.status.starts_with("Não salvou") || self.form.to_config(&self.folders, self.theme).is_err() {
+                    // Keep the dialog open with what was typed; undo the list change.
+                    self.folders = before;
+                    self.rule_edit = Some(edit);
+                }
+                return task;
+            }
+            Msg::RemoveFolder => self.confirm_remove = self.folder_sel.is_some(),
+            Msg::ConfirmRemove => {
+                if let Some(i) = self.folder_sel.take() {
+                    self.folders.remove(i);
+                    return self.save_config();
+                }
+            }
+            Msg::Field(f, v) => self.form.set(f, v),
+            Msg::Theme(t) => self.theme = t,
+            Msg::Save => return self.save_config(),
+            Msg::Install => {
+                let task = self.save_config();
+                if !self.status.starts_with("Configuração salva") {
+                    return task;
+                }
+                self.busy = true;
+                return work(|| {
+                    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+                    install::install(&install::WinHost, install::EMBEDDED_DRIVER, &exe).map_err(|e| e.to_string())?;
+                    install::start_service(install::OWN_SERVICE)?;
+                    Ok(format!("Instalado e iniciado. O serviço usa {}; não mova este arquivo.", exe.display()))
+                });
+            }
+            Msg::Start => {
+                self.busy = true;
+                return work(|| install::start_service(install::OWN_SERVICE).map(|_| "Serviço iniciado.".into()));
+            }
+            Msg::Stop => {
+                self.busy = true;
+                return work(|| install::stop_own_service().map(|_| "Serviço parado.".into()));
+            }
+            Msg::Exit => return iced::exit(),
+            Msg::Done(r) => {
+                self.busy = false;
+                self.status = match r {
+                    Ok(s) => s,
+                    Err(e) => format!("Erro: {e}"),
+                };
+                self.refresh();
+            }
+        }
+        Task::none()
+    }
+
+    fn view(&self) -> Element<'_, Msg> {
+        let p = self.pal();
+        let tab = |label: &'static str, t: Tab| {
+            iced::widget::button(text(label).size(13))
+                .padding([5, 14])
+                .style(theme::tab_button(p, self.tab == t, t == Tab::Arquivo))
+                .on_press(Msg::Tab(t))
+        };
+        let tabs = container(row![
+            tab("Arquivo", Tab::Arquivo),
+            tab("Início", Tab::Inicio),
+            tab("Pastas protegidas", Tab::Pastas),
+            tab("Configurações", Tab::Config),
+        ])
+        .width(Length::Fill)
+        .style(theme::surface(p, p.panel));
+        let body = match self.tab {
+            Tab::Arquivo => settings::view_file(self),
+            Tab::Inicio => home::view(self),
+            Tab::Pastas => folders::view(self),
+            Tab::Config => settings::view(self),
+        };
+        container(column![tabs, container(body).height(Length::Fill), self.status_bar()])
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::surface(p, p.bg))
+            .into()
+    }
+
+    fn status_bar(&self) -> Element<'_, Msg> {
+        let p = self.pal();
+        let state = |label: &'static str, ok: bool, word: &'static str| {
+            row![
+                icons::icon(if ok { "check_circle" } else { "error" }, 15.0, if ok { p.ok } else { p.danger }),
+                text(format!("{label}: {word}")).size(12),
+            ]
+            .spacing(4)
+            .align_y(Alignment::Center)
+        };
+        let svc_word = match self.svc {
+            SvcState::Running => "rodando",
+            SvcState::Stopped => "parado",
+            SvcState::Busy => "iniciando/parando",
+            SvcState::NotInstalled => "não instalado",
+        };
+        let used = self.tree.info("").size;
+        let limit = self.form.max_gb.replace(',', ".").parse::<f64>().unwrap_or(0.0);
+        let msg = if self.busy { "Trabalhando..." } else { self.status.as_str() };
+        container(
+            row![
+                state("Serviço", self.svc == SvcState::Running, svc_word),
+                state("Driver", self.driver == SvcState::Running, if self.driver == SvcState::Running { "carregado" } else { "não carregado" }),
+                state("Auditoria", self.audit.policy_success, if self.audit.policy_success { "ativa" } else { "desligada" }),
+                text(format!("Lixeira: {} de {limit} GB", listing::fmt_size(used))).size(12),
+                text(format!("{} selecionado(s)", self.selected.len())).size(12),
+                Space::new().width(Length::Fill),
+                text(msg.to_string()).size(12),
+            ]
+            .spacing(18)
+            .align_y(Alignment::Center),
+        )
+        .padding([4, 10])
+        .width(Length::Fill)
+        .style(theme::surface(p, p.panel))
+        .into()
+    }
+}
