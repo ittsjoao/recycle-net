@@ -223,7 +223,7 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         relaunch_elevated()?;
         return Ok(());
     }
-    rnetrbin_svc::gui::run()?;
+    rnetrbin_svc::gui_old::run()?;
     Ok(())
 }
 
