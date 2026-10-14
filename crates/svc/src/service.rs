@@ -476,13 +476,22 @@ pub fn run(
     take_over_original: bool,
 ) -> Result<(), ServiceError> {
     let mut driver = WinDriver::new(&cfg);
+    let audit = crate::audit::spawn(&cfg, stop.clone());
     let s2 = stop.clone();
     let sleep = move |d: Duration| sleep_interruptible(d, &s2);
-    if take_over_original {
-        run_with(cfg, stop, &handback_on_exit, &WinScm, &FileStore::new(STATE_PATH), &mut driver, &sleep)
+    let res = if take_over_original {
+        run_with(cfg, stop.clone(), &handback_on_exit, &WinScm, &FileStore::new(STATE_PATH), &mut driver, &sleep)
     } else {
-        run_with(cfg, stop, &handback_on_exit, &NoScm, &NoStore, &mut driver, &sleep)
+        run_with(cfg, stop.clone(), &handback_on_exit, &NoScm, &NoStore, &mut driver, &sleep)
+    };
+    // run_with returns on STOP or early exit; make sure the audit threads stop too.
+    stop.store(true, Ordering::Relaxed);
+    for h in audit {
+        if h.join().is_err() {
+            tracing::error!("audit thread panicked");
+        }
     }
+    res
 }
 
 /// SCM stand-in for `--console` without `--takeover`: touches nothing.
