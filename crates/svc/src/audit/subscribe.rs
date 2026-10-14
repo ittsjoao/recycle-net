@@ -9,7 +9,7 @@ use crate::index::Index;
 use windows::core::{HSTRING, PCWSTR};
 use windows::Win32::System::EventLog::{
     EvtClose, EvtCreateBookmark, EvtRender, EvtRenderBookmark, EvtRenderEventXml, EvtSubscribe,
-    EvtSubscribeActionDeliver, EvtSubscribeStartAfterBookmark, EvtSubscribeToFutureEvents, EvtUpdateBookmark,
+    EvtSubscribeActionDeliver, EvtSubscribeActionError, EvtSubscribeStartAfterBookmark, EvtSubscribeToFutureEvents, EvtUpdateBookmark,
     EVT_HANDLE, EVT_RENDER_FLAGS, EVT_SUBSCRIBE_NOTIFY_ACTION,
 };
 
@@ -23,8 +23,13 @@ pub fn under_any(roots: &[String], path: &str) -> bool {
     roots.iter().any(|r| nests(std::path::Path::new(r), p))
 }
 
+enum Msg {
+    Event(String),
+    Error(u32),
+}
+
 struct Sink {
-    tx: mpsc::Sender<String>,
+    tx: mpsc::Sender<Msg>,
     bookmark: Mutex<EVT_HANDLE>,
 }
 
@@ -50,11 +55,14 @@ unsafe extern "system" fn on_event(
     let sink = &*(ctx as *const Sink);
     if action == EvtSubscribeActionDeliver {
         if let Some(xml) = render(ev, EvtRenderEventXml) {
-            let _ = sink.tx.send(xml);
+            let _ = sink.tx.send(Msg::Event(xml));
         }
         if let Ok(bm) = sink.bookmark.lock() {
             let _ = EvtUpdateBookmark(*bm, ev);
         }
+    } else if action == EvtSubscribeActionError {
+        // For the error action `ev` carries a Win32 error code, not a handle.
+        let _ = sink.tx.send(Msg::Error(ev.0 as u32));
     }
     0
 }
@@ -69,22 +77,38 @@ fn save_bookmark(idx: &Index, sink: &Sink) {
     }
 }
 
+fn handle_event(idx: &Index, roots: &[String], xml: &str) {
+    if let Some(e) = crate::audit::event::parse_4663(xml) {
+        if under_any(roots, &e.path) {
+            if let Err(err) = idx.add_delete_event(&e) {
+                tracing::warn!("audit: cannot store event: {err}");
+            }
+        }
+    }
+}
+
 /// Runs until `stop`. Resumes after the saved bookmark, so a short service
 /// restart loses no event still in the log.
 pub fn run(idx: Arc<Index>, roots: Vec<String>, stop: Arc<AtomicBool>) -> Result<(), String> {
     let saved = idx.get_kv(BOOKMARK_KEY).map_err(|e| e.to_string())?;
-    let bookmark = unsafe {
-        match &saved {
-            Some(xml) => EvtCreateBookmark(&HSTRING::from(xml.as_str())),
-            None => EvtCreateBookmark(PCWSTR::null()),
+    let from_saved = saved.as_ref().and_then(|xml| match unsafe { EvtCreateBookmark(&HSTRING::from(xml.as_str())) } {
+        Ok(b) => Some(b),
+        Err(e) => {
+            tracing::warn!("audit: saved bookmark unusable ({e}); starting from new events");
+            None
         }
-    }
-    .map_err(|e| format!("EvtCreateBookmark: {e}"))?;
+    });
+    let resume = from_saved.is_some();
+    let bookmark = match from_saved {
+        Some(b) => b,
+        None => unsafe { EvtCreateBookmark(PCWSTR::null()) }.map_err(|e| format!("EvtCreateBookmark: {e}"))?,
+    };
     let (tx, rx) = mpsc::channel();
     let sink = Box::new(Sink { tx, bookmark: Mutex::new(bookmark) });
-    let (start, flags) = match saved {
-        Some(_) => (bookmark, EvtSubscribeStartAfterBookmark.0),
-        None => (EVT_HANDLE::default(), EvtSubscribeToFutureEvents.0),
+    let (start, flags) = if resume {
+        (bookmark, EvtSubscribeStartAfterBookmark.0)
+    } else {
+        (EVT_HANDLE::default(), EvtSubscribeToFutureEvents.0)
     };
     let sub = unsafe {
         EvtSubscribe(
@@ -98,20 +122,22 @@ pub fn run(idx: Arc<Index>, roots: Vec<String>, stop: Arc<AtomicBool>) -> Result
             flags,
         )
     }
-    .map_err(|e| format!("EvtSubscribe: {e}"))?;
+    .map_err(|e| {
+        unsafe {
+            let _ = EvtClose(bookmark);
+        }
+        format!("EvtSubscribe: {e}")
+    })?;
     tracing::info!("audit: subscribed to Security 4663");
 
+    let mut failure = None;
     let mut last_save = Instant::now();
     while !stop.load(Ordering::Relaxed) {
         match rx.recv_timeout(Duration::from_secs(1)) {
-            Ok(xml) => {
-                if let Some(e) = crate::audit::event::parse_4663(&xml) {
-                    if under_any(&roots, &e.path) {
-                        if let Err(err) = idx.add_delete_event(&e) {
-                            tracing::warn!("audit: cannot store event: {err}");
-                        }
-                    }
-                }
+            Ok(Msg::Event(xml)) => handle_event(&idx, &roots, &xml),
+            Ok(Msg::Error(code)) => {
+                failure = Some(format!("EvtSubscribe error {code}"));
+                break;
             }
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -125,12 +151,21 @@ pub fn run(idx: Arc<Index>, roots: Vec<String>, stop: Arc<AtomicBool>) -> Result
     unsafe {
         let _ = EvtClose(sub);
     }
+    // The bookmark already moved past anything still queued: store it before saving.
+    for msg in rx.try_iter() {
+        if let Msg::Event(xml) = msg {
+            handle_event(&idx, &roots, &xml);
+        }
+    }
     save_bookmark(&idx, &sink);
     unsafe {
         let _ = EvtClose(bookmark);
     }
     drop(sink);
-    Ok(())
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
 }
 
 #[cfg(test)]
