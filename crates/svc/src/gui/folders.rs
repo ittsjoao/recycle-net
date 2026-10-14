@@ -26,6 +26,15 @@ impl RuleEdit {
     }
 }
 
+/// Put an edited rule in the list: `None` appends, `Some(i)` replaces folder `i`.
+pub fn apply_rule(folders: &mut Vec<FolderRule>, index: Option<usize>, rule: FolderRule) -> Result<(), String> {
+    match index {
+        Some(i) => *folders.get_mut(i).ok_or("A pasta editada não está mais na lista.")? = rule,
+        None => folders.push(rule),
+    }
+    Ok(())
+}
+
 pub(super) fn view(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
     let idle = !app.busy;
@@ -98,7 +107,7 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
                     .size(12)
                     .color(p.muted),
                     row![
-                        button(text("Salvar").size(13)).on_press(Msg::RuleSave),
+                        button(text("Salvar").size(13)).on_press_maybe(idle.then_some(Msg::RuleSave)),
                         button(text("Cancelar").size(13)).style(iced::widget::button::secondary).on_press(Msg::RuleCancel),
                         Space::new().width(Length::Fill),
                     ]
@@ -124,5 +133,18 @@ mod tests {
         let e = RuleEdit { index: Some(0), path: r"D:\X".into(), include: "*.xml ; *.pdf".into(), exclude: "".into() };
         assert_eq!(e.to_rule().include, ["*.xml", "*.pdf"]);
         assert!(e.to_rule().exclude.is_empty());
+    }
+
+    #[test]
+    fn apply_rule_replaces_appends_and_rejects_stale_index() {
+        let a = FolderRule::with_defaults(r"D:\A".into());
+        let b = FolderRule::with_defaults(r"D:\B".into());
+        let mut v = vec![a.clone()];
+        apply_rule(&mut v, None, b.clone()).unwrap();
+        assert_eq!(v, [a.clone(), b.clone()]);
+        apply_rule(&mut v, Some(0), b.clone()).unwrap();
+        assert_eq!(v, [b.clone(), b.clone()]);
+        assert!(apply_rule(&mut v, Some(2), a).is_err());
+        assert_eq!(v, [b.clone(), b]);
     }
 }

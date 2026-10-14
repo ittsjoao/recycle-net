@@ -219,6 +219,10 @@ impl App {
         let files: Vec<(String, i64, i64)> =
             self.rows.iter().map(|r| (r.original_path.clone(), r.size, r.deleted_utc)).collect();
         self.tree = Tree::build(&roots, &files);
+        // The folder may be gone (orphan root emptied, or no longer protected).
+        if !self.cur.is_empty() && self.tree.root_of(&self.cur).is_none() {
+            self.cur.clear();
+        }
         self.relist();
     }
 
@@ -265,16 +269,18 @@ impl App {
                 self.selected.insert(id);
             }
             self.anchor = Some(id);
-        } else if self.mods.shift() && self.anchor.is_some() {
-            let pos = |x: i64| self.listing.files.iter().position(|f| f.id == x);
-            if let (Some(a), Some(b)) = (pos(self.anchor.unwrap_or(id)), pos(id)) {
-                let (lo, hi) = (a.min(b), a.max(b));
-                self.selected = self.listing.files[lo..=hi].iter().map(|f| f.id).collect();
-            }
+        } else if let (true, Some(Some(a)), Some(b)) = (self.mods.shift(), self.anchor.map(|x| self.pos(x)), self.pos(id)) {
+            let (lo, hi) = (a.min(b), a.max(b));
+            self.selected = self.listing.files[lo..=hi].iter().map(|f| f.id).collect();
         } else {
             self.selected = BTreeSet::from([id]);
             self.anchor = Some(id);
         }
+    }
+
+    /// Row of a file in the current listing.
+    fn pos(&self, id: i64) -> Option<usize> {
+        self.listing.files.iter().position(|f| f.id == id)
     }
 
     fn selected_versions(&self) -> Vec<Version> {
@@ -282,30 +288,31 @@ impl App {
     }
 
     /// Validate and write the config; restart the service if it is running.
-    fn save_config(&mut self) -> Task<Msg> {
+    /// None = nothing was written (the reason is in `status`).
+    fn save_config(&mut self) -> Option<Task<Msg>> {
         let mut cfg = match self.form.to_config(&self.folders, self.theme) {
             Ok(c) => c,
             Err(e) => {
                 self.status = e;
-                return Task::none();
+                return None;
             }
         };
         if let Err(e) = cfg.save(Path::new(CONFIG_PATH)) {
             self.status = format!("Não salvou: {e}");
-            return Task::none();
+            return None;
         }
         self.apply_config(&cfg);
         if self.svc != SvcState::Running {
             self.status = "Configuração salva.".into();
             self.refresh();
-            return Task::none();
+            return Some(Task::none());
         }
         self.busy = true;
-        work(|| {
+        Some(work(|| {
             install::stop_own_service()?;
             install::start_service(install::OWN_SERVICE)?;
             Ok("Configuração salva; serviço reiniciado.".into())
-        })
+        }))
     }
 
     fn restore(&mut self, dir: Option<PathBuf>) -> Task<Msg> {
@@ -422,34 +429,47 @@ impl App {
             }
             Msg::RuleCancel => self.rule_edit = None,
             Msg::RuleSave => {
+                if self.busy {
+                    return Task::none();
+                }
                 let Some(edit) = self.rule_edit.take() else { return Task::none() };
                 let before = self.folders.clone();
-                let rule = edit.to_rule();
-                match edit.index {
-                    Some(i) => self.folders[i] = rule,
-                    None => self.folders.push(rule),
+                if let Err(e) = folders::apply_rule(&mut self.folders, edit.index, edit.to_rule()) {
+                    self.status = e;
+                    return Task::none();
                 }
-                let task = self.save_config();
-                if self.status.starts_with("Não salvou") || self.form.to_config(&self.folders, self.theme).is_err() {
-                    // Keep the dialog open with what was typed; undo the list change.
-                    self.folders = before;
-                    self.rule_edit = Some(edit);
+                match self.save_config() {
+                    Some(task) => return task,
+                    None => {
+                        // Keep the dialog open with what was typed; undo the list change.
+                        self.folders = before;
+                        self.rule_edit = Some(edit);
+                    }
                 }
-                return task;
             }
             Msg::RemoveFolder => self.confirm_remove = self.folder_sel.is_some(),
             Msg::ConfirmRemove => {
                 if let Some(i) = self.folder_sel.take() {
+                    // An open editor's index would point at the wrong folder now.
+                    self.rule_edit = None;
+                    let before = self.folders.clone();
                     self.folders.remove(i);
-                    return self.save_config();
+                    match self.save_config() {
+                        Some(task) => return task,
+                        None => {
+                            self.folders = before;
+                            self.folder_sel = Some(i);
+                        }
+                    }
                 }
             }
             Msg::Field(f, v) => self.form.set(f, v),
             Msg::Theme(t) => self.theme = t,
-            Msg::Save => return self.save_config(),
+            Msg::Save => return self.save_config().unwrap_or_else(Task::none),
             Msg::Install => {
-                let task = self.save_config();
-                if !self.status.starts_with("Configuração salva") {
+                let Some(task) = self.save_config() else { return Task::none() };
+                if self.busy {
+                    // A service restart is in flight; never install over it.
                     return task;
                 }
                 self.busy = true;
