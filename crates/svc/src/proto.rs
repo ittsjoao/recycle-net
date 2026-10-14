@@ -41,7 +41,7 @@ mod tests {
 
     #[test]
     fn setup_header_layout_is_exact() {
-        let b = encode_setup(true, "D:\Bin");
+        let b = encode_setup(true, "D:\\Bin");
         assert_eq!(b[0], 1);
         assert_eq!(b[1], 0);
         let cb = u16::from_le_bytes([b[2], b[3]]);
@@ -52,7 +52,7 @@ mod tests {
 
     #[test]
     fn setup_disabled_has_zero_flag() {
-        let b = encode_setup(false, "D:\Bin");
+        let b = encode_setup(false, "D:\\Bin");
         assert_eq!(b[0], 0);
     }
 
