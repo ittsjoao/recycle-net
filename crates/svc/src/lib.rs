@@ -3,3 +3,4 @@ pub mod port;
 pub mod config;
 pub mod index;
 pub mod finalize;
+pub mod watcher;
