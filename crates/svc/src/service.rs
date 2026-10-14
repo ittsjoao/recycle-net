@@ -394,7 +394,7 @@ pub fn run_with<S: Scm, T: StateStore, D: Driver>(
             Ok(_) => {}
             Err(e) => tracing::warn!("retention tick failed: {e}"),
         }
-        if let Err(e) = watcher::reconcile(&idx, &cfg.recycle_dir) {
+        if let Err(e) = watcher::reconcile_until(&idx, &cfg.recycle_dir, &stop) {
             tracing::warn!("reconcile failed: {e}");
         }
         sleep(TICK);

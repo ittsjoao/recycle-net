@@ -88,19 +88,6 @@ fn adopt(idx: &Index, file: &Path, orig_base: &Path, recycle_root: &Path, delete
     Ok(Some(idx.insert(&df)?))
 }
 
-/// Adopt a non-flag, non-.nrbnew recycle file that has no row (e.g. a crash
-/// between rename and commit). Zero-byte files (unused reservations) are skipped.
-/// NOTE: the original path is derived from the file's own name, so a unique
-/// suffix (`a.1.txt`) cannot be told apart from a real name here.
-pub fn adopt_unindexed(idx: &Index, file: &Path, recycle_root: &Path)
-    -> Result<Option<i64>, FinalizeError>
-{
-    let meta = std::fs::metadata(file)?;
-    if meta.len() == 0 { return Ok(None); }
-    let t = secs(meta.modified()).unwrap_or_else(now_secs);
-    adopt(idx, file, file, recycle_root, t)
-}
-
 pub fn finalize_one(idx: &Index, nrbnew: &Path, recycle_root: &Path)
     -> Result<Option<i64>, FinalizeError>
 {

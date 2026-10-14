@@ -18,6 +18,7 @@ CREATE TABLE IF NOT EXISTS deleted_files(
 CREATE INDEX IF NOT EXISTS ix_deleted_utc ON deleted_files(deleted_utc);
 CREATE INDEX IF NOT EXISTS ix_original_path ON deleted_files(original_path);
 CREATE INDEX IF NOT EXISTS ix_volume ON deleted_files(volume);
+CREATE INDEX IF NOT EXISTS ix_backup_path ON deleted_files(backup_path);
 "#;
 
 impl Index {
@@ -120,6 +121,21 @@ mod tests {
         DeletedFile { original_path: format!("D:\\a\\{ts}.txt"),
             backup_path: format!("D:\\bin\\{ts}.txt"), volume: "D:".into(),
             size, deleted_utc: ts, user_sid: None, user_name: None }
+    }
+    #[test]
+    fn backup_path_lookups_are_indexed() {
+        // reconcile/adoption query by backup_path for every candidate; without
+        // an index each lookup is a full table scan (O(N^2) per reconcile).
+        let idx = Index::open_memory().unwrap();
+        let conn = idx.c();
+        let plan: String = conn
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT COUNT(*) FROM deleted_files WHERE backup_path = 'x'",
+                [],
+                |r| r.get(3),
+            )
+            .unwrap();
+        assert!(plan.contains("ix_backup_path"), "query plan: {plan}");
     }
     fn assert_send_sync<T: Send + Sync>() {}
     #[test]
