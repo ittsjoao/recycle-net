@@ -36,8 +36,8 @@ conversa com o minifilter de terceiro `netrbin.sys` (produto licenciado) pela po
   sem ele (build.rs); o exe gerado nao pode ser publicado.
 - Porta do driver aceita UM cliente: com SNetRBin rodando, nada conecta. Desinstalar o original apaga o driver.
 - Assinatura do driver cross-signed 2015 (expirou 2016): pode cair com HVCI (Win 11 / Server 2022).
-- Mascaras do driver casam com o caminho DOS completo em MAIUSCULAS: use
-  `config::driver_masks`, nunca a mascara crua. Layout de paths da copia nao confirmado em runtime.
+- Driver casa mascaras com `\E:\dir\arq` (barra na frente, MAIUSCULAS): use `config::driver_masks`.
+  Nao ve apagar local no Server 2019+ (classe 64); contrato da copia em `docs/notes/port-protocol-confirmation.md`.
 
 ## Tarefa, branch e commit
 

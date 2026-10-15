@@ -7,20 +7,18 @@ pub enum FinalizeError {
     #[error("db: {0}")] Db(#[from] rusqlite::Error),
 }
 
-/// Flag file naming: "<name>.nrbnew.nrbflag" (confirm at runtime, see docs/notes).
-pub fn flag_path(nrbnew: &Path) -> PathBuf {
-    let mut s = nrbnew.as_os_str().to_owned();
-    s.push(".nrbflag");
-    PathBuf::from(s)
-}
+/// Finalized backups live here, out of the driver's way: the driver only writes
+/// under `<recycle_root>\<DriveLetter>\`, and its copy fails (silently) when the
+/// name is taken, so nothing of ours may stay at a name it can write.
+pub const STORE_DIR: &str = ".store";
 
-pub fn is_complete(nrbnew: &Path) -> bool { flag_path(nrbnew).exists() }
+/// Driver contract (read from netrbin.sys, see docs/notes): it copies the deleted
+/// file to `<recycle_root>\<DriveLetter>\<path>\<name>`, then creates an empty
+/// `<name>.nrbnew` flag once the copy is complete. Data path of a flag:
+fn data_path(flag: &Path) -> PathBuf { flag.with_extension("") }
 
-/// Derive (volume, original_path) from the recycle-relative path of the backup
-/// (with the `.nrbnew` suffix already stripped).
-///
-/// ASSUMPTION (pending VM confirmation): the driver mirrors the volume-relative
-/// path under the recycle root as `<recycle_root>\<DriveLetter>\<rest of path>`.
+/// Derive (volume, original_path) from the recycle-relative path of the copy.
+/// The driver mirrors the path as `<recycle_root>\<DriveLetter>\<rest of path>`.
 /// A first component that is not a single ASCII letter yields an empty volume and
 /// the relative path as-is (non-absolute; restore without override will refuse it).
 pub fn derive_original(rel: &Path) -> (String, String) {
@@ -71,8 +69,8 @@ fn now_secs() -> i64 {
 }
 
 /// Create an index row for an already-finalized backup file that has none.
-/// `orig_base` is the path (under the recycle root, without unique suffix or
-/// `.nrbnew`) used to derive volume/original_path.
+/// `orig_base` is the driver's copy path (under the recycle root) used to
+/// derive volume/original_path.
 fn adopt(idx: &Index, file: &Path, orig_base: &Path, recycle_root: &Path, deleted_utc: i64)
     -> Result<Option<i64>, FinalizeError>
 {
@@ -88,44 +86,50 @@ fn adopt(idx: &Index, file: &Path, orig_base: &Path, recycle_root: &Path, delete
     Ok(Some(idx.insert(&df)?))
 }
 
-pub fn finalize_one(idx: &Index, nrbnew: &Path, recycle_root: &Path)
+/// Finalize the backup announced by `flag` (`<name>.nrbnew`): move the copy into
+/// the store and index it. A missing flag means the copy is still in progress.
+pub fn finalize_one(idx: &Index, flag: &Path, recycle_root: &Path)
     -> Result<Option<i64>, FinalizeError>
 {
-    finalize_with(idx, nrbnew, recycle_root, "COMMIT")
+    finalize_with(idx, flag, recycle_root, "COMMIT")
 }
 
-pub(crate) fn finalize_with(idx: &Index, nrbnew: &Path, recycle_root: &Path, commit_sql: &str)
+pub(crate) fn finalize_with(idx: &Index, flag: &Path, recycle_root: &Path, commit_sql: &str)
     -> Result<Option<i64>, FinalizeError>
 {
-    let flag = flag_path(nrbnew);
-    let base = nrbnew.with_extension(""); // strip .nrbnew
-    if !nrbnew.exists() {
-        if flag.exists() {
-            // Stale flag. A crash between rename and commit leaves a final file
-            // with no row: adopt it before discarding the flag (the only clue).
-            let t = secs(std::fs::metadata(&flag).and_then(|m| m.modified())).unwrap_or_else(now_secs);
-            let mut n = 0u32;
-            loop {
-                let cand = unique_candidate(&base, n);
-                if !cand.exists() { if n > 0 { break; } else { n += 1; continue; } }
-                if std::fs::metadata(&cand).map(|m| m.len() > 0).unwrap_or(false) {
-                    adopt(idx, &cand, &base, recycle_root, t)?;
-                }
-                n += 1;
+    // The driver's flags are always empty; a non-empty `x.nrbnew` is a deleted
+    // user file copied as data, finalized through its own flag.
+    match std::fs::metadata(flag) {
+        Ok(m) if m.len() == 0 => {}
+        _ => return Ok(None),
+    }
+    let data = data_path(flag);
+    let rel = data.strip_prefix(recycle_root).unwrap_or(&data).to_path_buf();
+    let base = recycle_root.join(STORE_DIR).join(&rel);
+    // the flag is written at copy completion ~ deletion time; the copy's mtime
+    // may be the source's preserved mtime.
+    let deleted_utc = secs(std::fs::metadata(flag).and_then(|m| m.modified())).unwrap_or_else(now_secs);
+    if !data.exists() {
+        // Flag without copy. Either a crash between the move and the commit
+        // (a stored file with no row: adopt it, the flag is the only clue) or
+        // the driver's copy hit an existing name and was dropped.
+        let mut n = 0u32;
+        loop {
+            let cand = unique_candidate(&base, n);
+            if !cand.exists() { if n > 0 { break; } else { n += 1; continue; } }
+            if std::fs::metadata(&cand).map(|m| m.len() > 0).unwrap_or(false) {
+                adopt(idx, &cand, &data, recycle_root, deleted_utc)?;
             }
-            let _ = std::fs::remove_file(&flag);
+            n += 1;
         }
+        tracing::warn!("flag {} has no copy next to it; removed", flag.display());
+        let _ = std::fs::remove_file(flag);
         return Ok(None);
     }
-    if !flag.exists() { return Ok(None); }
 
-    let meta = std::fs::metadata(nrbnew)?;
-    let rel = base.strip_prefix(recycle_root).unwrap_or(&base);
-    let (volume, original_path) = derive_original(rel);
-    // flag is written at copy completion ~ deletion time; the .nrbnew mtime may
-    // be the source's preserved mtime.
-    let deleted_utc = secs(std::fs::metadata(&flag).and_then(|m| m.modified())).unwrap_or_else(now_secs);
-
+    let meta = std::fs::metadata(&data)?;
+    let (volume, original_path) = derive_original(&rel);
+    if let Some(dir) = base.parent() { std::fs::create_dir_all(dir)?; }
     let final_path = reserve_unique(&base)?;
     let df = DeletedFile {
         original_path, volume,
@@ -133,25 +137,25 @@ pub(crate) fn finalize_with(idx: &Index, nrbnew: &Path, recycle_root: &Path, com
         size: meta.len() as i64, deleted_utc,
         user_sid: None, user_name: None,
     };
-    // row insert + rename in one transaction; rollback if the rename fails
+    // row insert + move in one transaction; rollback if the move fails
     let renamed = std::cell::Cell::new(false);
     let res = idx.insert_with_commit(&df, commit_sql, || {
-        std::fs::rename(nrbnew, &final_path).map_err(FinalizeError::Io)?;
+        std::fs::rename(&data, &final_path).map_err(FinalizeError::Io)?;
         renamed.set(true);
         Ok(())
     });
     match res {
         Ok(id) => {
-            let _ = std::fs::remove_file(&flag); // LAST
+            let _ = std::fs::remove_file(flag); // LAST
             Ok(Some(id))
         }
         Err(e) => {
             if renamed.get() {
-                // commit failed after the rename: put the backup back so the next
+                // commit failed after the move: put the copy back so the next
                 // reconcile retries; never delete it. The flag is kept.
-                if std::fs::rename(&final_path, nrbnew).is_err() {
+                if std::fs::rename(&final_path, &data).is_err() {
                     tracing::warn!("commit failed and could not restore {}; backup kept at {}",
-                        nrbnew.display(), final_path.display());
+                        data.display(), final_path.display());
                 }
             } else {
                 let _ = std::fs::remove_file(&final_path); // drop the reservation only
@@ -165,120 +169,134 @@ pub(crate) fn finalize_with(idx: &Index, nrbnew: &Path, recycle_root: &Path, com
 mod tests {
     use super::*;
     use std::fs;
-    #[test]
-    fn skips_incomplete_backup() {
-        let dir = tempfile::tempdir().unwrap();
-        let nrb = dir.path().join("a.txt.nrbnew");
-        fs::write(&nrb, b"partial").unwrap(); // no flag file
-        let idx = crate::index::Index::open_memory().unwrap();
-        assert_eq!(finalize_one(&idx, &nrb, dir.path()).unwrap(), None);
-        assert_eq!(idx.total_size().unwrap(), 0);
+    /// What the driver leaves for one deleted file: the copy under its own name
+    /// at `rel`, then an empty `<name>.nrbnew` completion flag. Returns the flag.
+    fn drop_backup(root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+        let data = root.join(rel);
+        fs::create_dir_all(data.parent().unwrap()).unwrap();
+        fs::write(&data, bytes).unwrap();
+        let flag = root.join(format!("{rel}.nrbnew"));
+        fs::write(&flag, b"").unwrap();
+        flag
     }
     #[test]
-    fn finalizes_complete_backup_once() {
+    fn skips_copy_still_in_progress() {
         let dir = tempfile::tempdir().unwrap();
-        let nrb = dir.path().join("a.txt.nrbnew");
-        fs::write(&nrb, b"hello").unwrap();
-        fs::write(flag_path(&nrb), b"").unwrap(); // completion flag
+        let data = dir.path().join("a.txt");
+        fs::write(&data, b"partial").unwrap(); // no flag yet
         let idx = crate::index::Index::open_memory().unwrap();
-        let id1 = finalize_one(&idx, &nrb, dir.path()).unwrap();
-        assert!(id1.is_some());
-        assert!(!nrb.exists());
-        assert!(dir.path().join("a.txt").exists());
-        assert!(!flag_path(&nrb).exists());
-        let id2 = finalize_one(&idx, &nrb, dir.path()).unwrap();
-        assert_eq!(id2, None);
+        assert_eq!(finalize_one(&idx, &dir.path().join("a.txt.nrbnew"), dir.path()).unwrap(), None);
+        assert_eq!(idx.total_size().unwrap(), 0);
+        assert!(data.exists());
+    }
+    #[test]
+    fn finalizes_into_the_store_and_frees_the_driver_slot() {
+        let dir = tempfile::tempdir().unwrap();
+        let flag = drop_backup(dir.path(), r"D\a.txt", b"hello");
+        let idx = crate::index::Index::open_memory().unwrap();
+        let id = finalize_one(&idx, &flag, dir.path()).unwrap().unwrap();
+        assert!(!dir.path().join(r"D\a.txt").exists());
+        assert!(!flag.exists());
+        let (_, backup) = idx.conn_row(id).unwrap();
+        assert_eq!(Path::new(&backup), dir.path().join(r".store\D\a.txt"));
+        assert_eq!(fs::read(&backup).unwrap(), b"hello");
+        assert_eq!(finalize_one(&idx, &flag, dir.path()).unwrap(), None);
         assert_eq!(idx.total_size().unwrap(), 5);
     }
     #[test]
     fn same_name_twice_keeps_both_backups() {
         let dir = tempfile::tempdir().unwrap();
         let idx = crate::index::Index::open_memory().unwrap();
-        let nrb = dir.path().join("a.txt.nrbnew");
-        fs::write(&nrb, b"first").unwrap();
-        fs::write(flag_path(&nrb), b"").unwrap();
-        let id1 = finalize_one(&idx, &nrb, dir.path()).unwrap().unwrap();
-        fs::write(&nrb, b"second!").unwrap();
-        fs::write(flag_path(&nrb), b"").unwrap();
-        let id2 = finalize_one(&idx, &nrb, dir.path()).unwrap().unwrap();
+        let flag = drop_backup(dir.path(), r"D\a.txt", b"first");
+        let id1 = finalize_one(&idx, &flag, dir.path()).unwrap().unwrap();
+        drop_backup(dir.path(), r"D\a.txt", b"second!");
+        let id2 = finalize_one(&idx, &flag, dir.path()).unwrap().unwrap();
         let (_, b1) = idx.conn_row(id1).unwrap();
         let (_, b2) = idx.conn_row(id2).unwrap();
         assert_ne!(b1, b2);
         assert_eq!(fs::read(&b1).unwrap(), b"first");
         assert_eq!(fs::read(&b2).unwrap(), b"second!");
-        assert_eq!(idx.count_by_backup_path(&b1).unwrap(), 1);
+        assert!(b2.ends_with(r".store\D\a.1.txt"));
     }
     #[test]
     fn commit_failure_keeps_backup_and_flag_and_retry_succeeds() {
         let dir = tempfile::tempdir().unwrap();
-        let nrb = dir.path().join("a.txt.nrbnew");
-        fs::write(&nrb, b"precious").unwrap();
-        fs::write(flag_path(&nrb), b"").unwrap();
+        let flag = drop_backup(dir.path(), r"D\a.txt", b"precious");
         let idx = crate::index::Index::open_memory().unwrap();
-        // forced commit failure (syntax error) AFTER the rename succeeded
-        assert!(finalize_with(&idx, &nrb, dir.path(), "COMMIT BOGUS").is_err());
-        assert_eq!(fs::read(&nrb).unwrap(), b"precious"); // put back as .nrbnew
-        assert!(flag_path(&nrb).exists());
+        // forced commit failure (syntax error) AFTER the move succeeded
+        assert!(finalize_with(&idx, &flag, dir.path(), "COMMIT BOGUS").is_err());
+        assert_eq!(fs::read(dir.path().join(r"D\a.txt")).unwrap(), b"precious"); // put back
+        assert!(flag.exists());
         assert_eq!(idx.total_size().unwrap(), 0);
         // same connection is not stuck in a transaction: retry succeeds
-        let id = finalize_one(&idx, &nrb, dir.path()).unwrap();
-        assert!(id.is_some());
-        assert_eq!(idx.total_size().unwrap(), 8);
-        assert_eq!(fs::read(dir.path().join("a.txt")).unwrap(), b"precious");
+        assert!(finalize_one(&idx, &flag, dir.path()).unwrap().is_some());
+        assert_eq!(fs::read(dir.path().join(r".store\D\a.txt")).unwrap(), b"precious");
     }
     #[test]
-    fn unindexed_final_file_with_stale_flag_is_adopted_and_evictable() {
+    fn unindexed_stored_file_with_stale_flag_is_adopted_and_evictable() {
+        // crash between the move into the store and the commit
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("D");
-        fs::create_dir_all(&sub).unwrap();
-        let fin = sub.join("a.txt");
+        let fin = dir.path().join(r".store\D\a.txt");
+        fs::create_dir_all(fin.parent().unwrap()).unwrap();
         fs::write(&fin, vec![1u8; 10]).unwrap();
-        let nrb = sub.join("a.txt.nrbnew");
-        fs::write(flag_path(&nrb), b"").unwrap(); // stale flag, no .nrbnew, no row
+        let flag = dir.path().join(r"D\a.txt.nrbnew");
+        fs::create_dir_all(flag.parent().unwrap()).unwrap();
+        fs::write(&flag, b"").unwrap();
         let idx = crate::index::Index::open_memory().unwrap();
         crate::watcher::reconcile(&idx, dir.path()).unwrap();
-        assert!(!flag_path(&nrb).exists());
+        assert!(!flag.exists());
         assert_eq!(idx.total_size().unwrap(), 10);
-        let freed = crate::retention::enforce(&idx, 0, None).unwrap();
-        assert_eq!(freed, 10);
+        assert_eq!(crate::retention::enforce(&idx, 0, None).unwrap(), 10);
         assert!(!fin.exists());
     }
     #[test]
     fn deleted_utc_comes_from_flag_mtime() {
         let dir = tempfile::tempdir().unwrap();
-        let nrb = dir.path().join("a.txt.nrbnew");
-        fs::write(&nrb, b"x").unwrap();
-        let fl = flag_path(&nrb);
-        fs::write(&fl, b"").unwrap();
+        let flag = drop_backup(dir.path(), "a.txt", b"x");
         let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000_000);
-        fs::OpenOptions::new().write(true).open(&fl).unwrap().set_modified(t).unwrap();
+        fs::OpenOptions::new().write(true).open(&flag).unwrap().set_modified(t).unwrap();
         let idx = crate::index::Index::open_memory().unwrap();
-        let id = finalize_one(&idx, &nrb, dir.path()).unwrap().unwrap();
+        let id = finalize_one(&idx, &flag, dir.path()).unwrap().unwrap();
         assert_eq!(idx.deleted_utc(id).unwrap(), 1_000_000_000);
     }
     #[test]
-    fn stale_flag_without_backup_is_cleaned() {
+    fn flag_without_copy_is_cleaned_and_indexed_backups_are_not_readopted() {
+        // The driver's copy hit an existing name (FILE_CREATE) but it still
+        // wrote the flag: drop the flag, never index the old file again.
         let dir = tempfile::tempdir().unwrap();
-        let nrb = dir.path().join("a.txt.nrbnew");
-        fs::write(flag_path(&nrb), b"").unwrap();
         let idx = crate::index::Index::open_memory().unwrap();
-        assert_eq!(finalize_one(&idx, &nrb, dir.path()).unwrap(), None);
-        assert!(!flag_path(&nrb).exists());
+        let flag = drop_backup(dir.path(), r"D\a.txt", b"old");
+        finalize_one(&idx, &flag, dir.path()).unwrap().unwrap();
+        fs::write(&flag, b"").unwrap(); // flag alone
+        assert_eq!(finalize_one(&idx, &flag, dir.path()).unwrap(), None);
+        assert!(!flag.exists());
+        assert_eq!(idx.total_size().unwrap(), 3);
+    }
+    #[test]
+    fn a_non_empty_file_named_nrbnew_is_data_not_a_flag() {
+        // A deleted user file called `x.nrbnew` is copied as data; with no `x`
+        // next to it, it must not be mistaken for a stale flag and removed.
+        let dir = tempfile::tempdir().unwrap();
+        let flag = drop_backup(dir.path(), "x.nrbnew", b"user data");
+        let idx = crate::index::Index::open_memory().unwrap();
+        let data = dir.path().join("x.nrbnew");
+        assert_eq!(finalize_one(&idx, &data, dir.path()).unwrap(), None);
+        assert!(data.exists());
+        assert!(finalize_one(&idx, &flag, dir.path()).unwrap().is_some());
+        assert_eq!(idx.total_size().unwrap(), 9);
     }
     #[test]
     fn rename_failure_rolls_back_row_and_keeps_flag() {
         let dir = tempfile::tempdir().unwrap();
-        let nrb = dir.path().join("a.txt.nrbnew");
-        fs::write(&nrb, b"x").unwrap();
-        fs::write(flag_path(&nrb), b"").unwrap();
-        // hold the source open without share-delete so rename fails on Windows
+        let flag = drop_backup(dir.path(), "a.txt", b"x");
+        // hold the copy open without share-delete so the move fails on Windows
         use std::os::windows::fs::OpenOptionsExt;
-        let _held = fs::OpenOptions::new().read(true).share_mode(1).open(&nrb).unwrap();
+        let _held = fs::OpenOptions::new().read(true).share_mode(1).open(dir.path().join("a.txt")).unwrap();
         let idx = crate::index::Index::open_memory().unwrap();
-        assert!(finalize_one(&idx, &nrb, dir.path()).is_err());
+        assert!(finalize_one(&idx, &flag, dir.path()).is_err());
         assert_eq!(idx.total_size().unwrap(), 0);
-        assert!(flag_path(&nrb).exists());
-        assert!(!dir.path().join("a.txt").exists());
+        assert!(flag.exists());
+        assert!(!dir.path().join(r".store\a.txt").exists());
     }
     #[test]
     fn derives_volume_and_original_from_mirror_layout() {
@@ -292,17 +310,13 @@ mod tests {
     #[test]
     fn finalize_records_derived_paths_without_unique_suffix() {
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("D").join("data");
-        fs::create_dir_all(&sub).unwrap();
         let idx = crate::index::Index::open_memory().unwrap();
         for _ in 0..2 {
-            let nrb = sub.join("a.txt.nrbnew");
-            fs::write(&nrb, b"z").unwrap();
-            fs::write(flag_path(&nrb), b"").unwrap();
-            finalize_one(&idx, &nrb, dir.path()).unwrap().unwrap();
+            let flag = drop_backup(dir.path(), r"D\data\a.txt", b"z");
+            finalize_one(&idx, &flag, dir.path()).unwrap().unwrap();
         }
         let (orig, backup, _) = idx.row_info(2).unwrap();
         assert_eq!(orig, "D:\\data\\a.txt");
-        assert!(backup.ends_with("a.1.txt"));
+        assert!(backup.ends_with(r".store\D\data\a.1.txt"));
     }
 }

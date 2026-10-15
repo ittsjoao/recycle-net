@@ -45,8 +45,11 @@ I8. Coexisting `install`: SNetRBin's `netrbin.sys` is not rewritten ("usando o d
 1. Large file (multiple 64KB chunks, > 128KB) deleted over SMB: finalized backup plus SQLite row appear; restore by id matches bytes.
 2. Excluded mask (e.g. `*.tmp`) is not captured.
 3. Quota eviction: exceed `max_bin_bytes`; oldest non-restored finalized backups are evicted first.
-4. Service stopped during a delete, then started: an orphan `.nrbnew` with a flag is reconciled; one without a flag is ignored.
-5. A `.nrbnew` without a flag is never indexed.
+4. Service stopped during a delete, then started: a copy with its `.nrbnew` flag is reconciled into `.store`;
+   a copy without a flag is left alone.
+5. A copy without a flag is never indexed.
+5a. Local delete on the server (`del`, Explorer: class 64) is NOT captured (driver limit); delete over SMB from
+    a client and with `FILE_DELETE_ON_CLOSE` are. Record which ones work on each OS.
 
 ## Must-confirm protocol facts (parked T1 — the code assumes these)
 These are assumptions baked into the service; confirm each on the VM and correct
@@ -54,18 +57,19 @@ the code if wrong (see also docs/notes/port-protocol-confirmation.md):
 6. **Buffer placement:** the driver reads the command from the InBuffer and the
    payload from the OutBuffer of `FilterSendMessage`. If reversed, `PortClient::send`
    swaps the two arguments.
-7. **Flag file name/semantics:** confirm the completion flag is `<name>.nrbnew.nrbflag`
-   and that its presence means "copy complete" (not "in progress"). The whole
-   finalize/watch design keys on this.
+7. **Flag file name/semantics** (read from the driver): the copy keeps the original
+   name and an empty `<name>.nrbnew` is created after it, meaning "copy complete".
+   Confirm at runtime; the whole finalize/watch design keys on this.
 8. **Recycle-dir feedback loop (highest risk):** with `rnetrbin-svc` running,
    confirm the driver does NOT capture the service's own writes inside
    `recycle_dir` — i.e. deleting a flag, evicting a backup, or the SQLite db does
    not produce new `.nrbnew` captures. If it does, backups loop. Mitigation in
    place: db_path is rejected inside recycle_dir, and the recycle dir is marked
    with `.rnetrbin-root`; still verify no self-capture.
-9. **Same path deleted twice while the service is down:** both deletions must
-   survive as two distinct backups (unique-name reservation); confirm the driver
-   does not overwrite the first `.nrbnew`/flag with the second.
+9. **Same path deleted twice before finalize** (service down, or two deletes within
+   milliseconds): the driver opens the copy with `FILE_CREATE`, so the second copy is
+   dropped and only its flag appears (logged as "flag ... has no copy"). Known driver
+   limit; with the service running the first copy leaves for `.store` right away.
 10. **Mirror layout:** confirm the on-disk path under the recycle root is
     `<root>\<DriveLetter>\<original relative path>` so `derive_original` restores
     to the right absolute path; adjust `derive_original` otherwise.
