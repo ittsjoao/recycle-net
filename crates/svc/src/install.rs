@@ -192,7 +192,9 @@ pub trait Host {
     /// Set the `netrbin` start type back to boot (0); nothing else changes.
     fn set_driver_boot_start(&self) -> Result<(), String>;
     /// Load the minifilter (already running is Ok).
-    fn start_driver(&self) -> Result<(), String>;
+    /// Ok(true) when Windows answered "already running" (0x420), which it also
+    /// says for a driver stuck stopping.
+    fn start_driver(&self) -> Result<bool, String>;
     /// Create `rnetrbin-svc` (auto start) pointing at `exe`, or repoint an existing
     /// one (its start type is kept).
     fn ensure_own_service(&self, exe: &Path) -> Result<(), String>;
@@ -239,11 +241,12 @@ pub fn install<H: Host>(host: &H, driver: &[u8], explicit: bool, exe: &Path) -> 
     if plan.fix_start {
         host.set_driver_boot_start().map_err(step("enable driver"))?;
     }
-    host.start_driver().map_err(step("load driver"))?;
-    // StartService also says "already running" (0x420) for a driver stuck stopping.
+    let said_running = host.start_driver().map_err(step("load driver"))?;
+    // "Already running" (0x420) while the driver is not running means it is stuck stopping.
     match host.driver_status().map_err(step("query driver"))?.service.map(|s| s.state) {
         Some(SvcState::Running) => {}
         Some(SvcState::Busy) => return Err(InstallError::DriverPending),
+        _ if said_running => return Err(InstallError::DriverPending),
         _ => return Err(InstallError::DriverNotRunning),
     }
     host.ensure_own_service(exe).map_err(step("register service"))?;
@@ -309,12 +312,20 @@ pub fn service_state(name: &str) -> Result<SvcState, String> {
 
 /// Start a service; already running is Ok.
 pub fn start_service(name: &str) -> Result<(), String> {
+    start_service_reporting(name).map(|_| ())
+}
+
+/// Start a service; Ok(true) when Windows answered "already running" (0x420).
+fn start_service_reporting(name: &str) -> Result<bool, String> {
     use windows::Win32::Foundation::ERROR_SERVICE_ALREADY_RUNNING;
     use windows::Win32::System::Services::*;
     let s = win::open(name, SERVICE_START)?.ok_or_else(|| format!("{name} is not installed"))?;
     match unsafe { StartServiceW(s.svc, None) } {
-        Ok(()) => Ok(()),
-        Err(e) if e.code() == ERROR_SERVICE_ALREADY_RUNNING.to_hresult() => Ok(()),
+        Ok(()) => Ok(false),
+        Err(e) if e.code() == ERROR_SERVICE_ALREADY_RUNNING.to_hresult() => {
+            tracing::info!("start {name}: already running (0x420)");
+            Ok(true)
+        }
         Err(e) => Err(format!("start {name}: {e}")),
     }
 }
@@ -618,8 +629,8 @@ impl Host for WinHost {
         Self::set_instance_keys()
     }
 
-    fn start_driver(&self) -> Result<(), String> {
-        start_service(DRIVER_SERVICE)
+    fn start_driver(&self) -> Result<bool, String> {
+        start_service_reporting(DRIVER_SERVICE)
     }
 
     fn ensure_own_service(&self, exe: &Path) -> Result<(), String> {
@@ -725,6 +736,8 @@ mod tests {
         drv: RefCell<DriverStatus>,
         /// State start_driver leaves the driver in (default Running).
         start_leaves: Option<SvcState>,
+        /// start_driver answers "already running" (0x420).
+        says_running: bool,
     }
     impl Mock {
         fn call(&self, name: &'static str) -> Result<(), String> {
@@ -764,12 +777,12 @@ mod tests {
             }
             Ok(())
         }
-        fn start_driver(&self) -> Result<(), String> {
+        fn start_driver(&self) -> Result<bool, String> {
             self.call("start_driver")?;
             if let Some(svc) = self.drv.borrow_mut().service.as_mut() {
                 svc.state = self.start_leaves.unwrap_or(SvcState::Running);
             }
-            Ok(())
+            Ok(self.says_running)
         }
         fn ensure_own_service(&self, _exe: &Path) -> Result<(), String> { self.call("own_svc") }
         fn remove_own_service(&self) -> Result<(), String> { self.call("rm_own") }
@@ -948,6 +961,24 @@ mod tests {
         let e = install(&m, EMBEDDED_DRIVER, false, Path::new(EXE)).unwrap_err();
         assert!(matches!(e, InstallError::DriverNotRunning));
         assert!(describe(&e).contains("Reinicie o servidor"));
+    }
+
+    #[test]
+    fn already_running_answer_with_driver_not_running_is_pending() {
+        // 0x420 from StartService, then the driver settles to Stopped: stuck stopping.
+        let m = Mock {
+            original: true,
+            says_running: true,
+            start_leaves: Some(SvcState::Stopped),
+            ..Mock::with_driver(BOOT_START, SvcState::Stopped, true)
+        };
+        let e = install(&m, EMBEDDED_DRIVER, false, Path::new(EXE)).unwrap_err();
+        assert!(matches!(e, InstallError::DriverPending));
+        assert_eq!(describe(&e), "O driver netrbin está parando e não responde. Reinicie o servidor e rode o setup de novo.");
+        assert!(!m.log().contains(&"own_svc"));
+        // 0x420 with the driver really running is fine.
+        let m = Mock { says_running: true, ..Mock::with_driver(BOOT_START, SvcState::Running, true) };
+        install(&m, EMBEDDED_DRIVER, false, Path::new(EXE)).unwrap();
     }
 
     #[test]
