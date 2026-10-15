@@ -604,7 +604,11 @@ impl App {
             Msg::Done(r) => {
                 self.busy = false;
                 if self.closing {
-                    return iced::exit();
+                    if r.is_ok() {
+                        return iced::exit();
+                    }
+                    // Stay open so a failure (e.g. a service left stopped) is seen; the next close exits.
+                    self.closing = false;
                 }
                 match r {
                     Ok(s) => self.notify(s, Kind::Ok),
