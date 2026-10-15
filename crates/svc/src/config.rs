@@ -233,6 +233,35 @@ impl Config {
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub enum InitConfig {
+    Created,
+    /// A config was already there (upgrade); it was left untouched.
+    AlreadyExists,
+}
+
+impl Config {
+    /// Config the setup writes on a first install: defaults, zero folders.
+    pub fn initial(recycle_dir: PathBuf) -> Config {
+        Config { recycle_dir, ..Config::default() }
+    }
+}
+
+/// `init-config`: write `Config::initial(recycle_dir)` to `path` unless a file is
+/// already there, creating and marking the recycle dir. Nothing is written when
+/// the path is invalid or the dir is populated and not rnetrbin's.
+pub fn init_config(path: &Path, recycle_dir: &Path) -> Result<InitConfig, ConfigError> {
+    if path.exists() {
+        return Ok(InitConfig::AlreadyExists);
+    }
+    let mut c = Config::initial(recycle_dir.to_path_buf());
+    c.normalize()?;
+    c.validate()?;
+    ensure_dedicated_dir(&c.recycle_dir)?;
+    c.save(path)?;
+    Ok(InitConfig::Created)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -401,5 +430,49 @@ include = ["*.xml", "*.pdf"]
         std::fs::write(t.path().join("user-data.xlsx"), b"x").unwrap();
         assert!(ensure_dedicated_dir(t.path()).is_err());
         assert!(!t.path().join(SENTINEL).exists());
+    }
+}
+
+#[cfg(test)]
+mod init_tests {
+    use super::*;
+
+    #[test]
+    fn initial_config_is_the_default_with_the_chosen_bin_and_no_folders() {
+        let c = Config::initial(r"E:\Lixeira".into());
+        assert_eq!(c, Config { recycle_dir: r"E:\Lixeira".into(), ..Config::default() });
+        assert!(c.folders.is_empty());
+        assert_eq!(c.max_bin_bytes, 10 * 1024 * 1024 * 1024);
+        c.validate().unwrap();
+    }
+
+    #[test]
+    fn init_config_creates_config_and_marked_bin_once() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("cfg").join("config.toml");
+        let bin = t.path().join("bin");
+        assert_eq!(init_config(&path, &bin).unwrap(), InitConfig::Created);
+        assert!(bin.join(SENTINEL).exists());
+        let loaded = Config::load(&path).unwrap();
+        assert_eq!(loaded.recycle_dir, bin);
+        assert!(loaded.folders.is_empty());
+        // A second run (upgrade) never rewrites the existing file.
+        std::fs::write(&path, "kept").unwrap();
+        assert_eq!(init_config(&path, &t.path().join("other")).unwrap(), InitConfig::AlreadyExists);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "kept");
+        assert!(!t.path().join("other").exists());
+    }
+
+    #[test]
+    fn init_config_writes_nothing_for_a_bad_or_populated_bin() {
+        let t = tempfile::tempdir().unwrap();
+        let path = t.path().join("config.toml");
+        assert!(init_config(&path, Path::new(r"\srv\share\bin")).is_err());
+        assert!(init_config(&path, Path::new("relative")).is_err());
+        let bin = t.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        std::fs::write(bin.join("user.xlsx"), b"x").unwrap();
+        assert!(init_config(&path, &bin).is_err());
+        assert!(!path.exists());
     }
 }
