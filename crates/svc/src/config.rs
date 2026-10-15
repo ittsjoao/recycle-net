@@ -82,10 +82,11 @@ fn anchored(f: &Path, m: &str) -> Vec<String> {
 }
 
 /// The netrbin driver matches each mask with FsRtlIsNameInExpression(IgnoreCase)
-/// against the deleted file's full DOS path (`D:\dir\file.ext`): masks must be
-/// uppercase and anchored on the whole path. It keeps a file that matches any
-/// include and no exclude. Returns (includes, excludes); the recycle dir and the
-/// db are always excluded so the service never captures its own writes.
+/// against the deleted file's path as it builds it: `\` + DOS drive + path
+/// (`\D:\dir\file.ext`, leading backslash included). Masks must be uppercase and
+/// anchored on that whole string. It keeps a file that matches any include and
+/// no exclude. Returns (includes, excludes); the recycle dir and the db are
+/// always excluded so the service never captures its own writes.
 pub fn driver_masks(c: &Config) -> (Vec<String>, Vec<String>) {
     let mut includes = Vec::new();
     let mut excludes = Vec::new();
@@ -95,7 +96,8 @@ pub fn driver_masks(c: &Config) -> (Vec<String>, Vec<String>) {
     }
     excludes.push(format!("{}\\*", c.recycle_dir.to_string_lossy()).to_uppercase());
     excludes.push(format!("{}*", c.db_path.to_string_lossy()).to_uppercase());
-    (includes, excludes)
+    let lead = |v: Vec<String>| v.into_iter().map(|m| format!("\\{m}")).collect();
+    (lead(includes), lead(excludes))
 }
 
 #[derive(thiserror::Error, Debug)]
@@ -318,7 +320,7 @@ include = ["*.xml", "*.pdf"]
         c.validate().unwrap();
         let (inc, exc) = driver_masks(&c);
         assert!(inc.is_empty());
-        assert_eq!(exc, [r"D:\X\*", r"D:\DB\I.DB*"]);
+        assert_eq!(exc, [r"\D:\X\*", r"\D:\DB\I.DB*"]);
     }
     #[test]
     fn folder_rules_are_validated() {
@@ -357,15 +359,15 @@ include = ["*.xml", "*.pdf"]
         c.validate().unwrap();
         let (inc, exc) = driver_masks(&c);
         assert_eq!(inc, [
-            r"D:\DADOS\CONTABIL\*",
-            r"D:\DADOS\FISCAL\*.XML",
-            r"D:\DADOS\FISCAL\RELATORIO.PDF", r"D:\DADOS\FISCAL\*\RELATORIO.PDF",
-            r"F:\*",
+            r"\D:\DADOS\CONTABIL\*",
+            r"\D:\DADOS\FISCAL\*.XML",
+            r"\D:\DADOS\FISCAL\RELATORIO.PDF", r"\D:\DADOS\FISCAL\*\RELATORIO.PDF",
+            r"\F:\*",
         ]);
         assert_eq!(exc, [
-            r"D:\DADOS\CONTABIL\*.BAK",
-            r"D:\DADOS\CONTABIL\~$*", r"D:\DADOS\CONTABIL\*\~$*",
-            r"E:\LIXEIRA\*", r"C:\PROGRAMDATA\RNETRBIN\INDEX.DB*",
+            r"\D:\DADOS\CONTABIL\*.BAK",
+            r"\D:\DADOS\CONTABIL\~$*", r"\D:\DADOS\CONTABIL\*\~$*",
+            r"\E:\LIXEIRA\*", r"\C:\PROGRAMDATA\RNETRBIN\INDEX.DB*",
         ]);
     }
     #[test]
