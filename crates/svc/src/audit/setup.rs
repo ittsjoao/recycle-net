@@ -33,6 +33,16 @@ pub struct AuditStatus {
     pub policy_success: bool,
     /// rnetrbin configured auditing on this machine (state file exists).
     pub configured: bool,
+    /// The SACL covers BUILTIN\Users (no domain): every local user, more events.
+    pub builtin_users: bool,
+}
+
+/// BUILTIN\Users, audited outside a domain.
+pub const BUILTIN_USERS_SID: &str = "S-1-5-32-545";
+
+/// The `audit-state.toml` text records a SACL for BUILTIN\Users.
+pub fn state_audits_builtin_users(state_toml: &str) -> bool {
+    toml::from_str::<AuditState>(state_toml).is_ok_and(|s| s.sacl_sid == BUILTIN_USERS_SID)
 }
 
 /// "Setting Value" (last column) of the `auditpol /backup` CSV line for `guid`.
@@ -56,7 +66,7 @@ pub fn parse_max_size(out: &str) -> Option<u64> {
 pub fn audit_users_sid(domain_sid: Option<&str>) -> String {
     match domain_sid {
         Some(d) => format!("{d}-513"),
-        None => "S-1-5-32-545".into(),
+        None => BUILTIN_USERS_SID.into(),
     }
 }
 
@@ -114,7 +124,15 @@ fn run(cmd: &str, args: &[String]) -> Result<String, String> {
 
 /// Current "Setting Value" of the File System subcategory (Err when the backup cannot be parsed).
 fn current_setting() -> Result<u8, String> {
-    let file = std::env::temp_dir().join(format!("rnetrbin-auditpol-{}.csv", std::process::id()));
+    // Not %TEMP%: as SYSTEM a predictable name there could be pre-planted. ProgramData\rnetrbin
+    // is ours; the name is unique per process and instant, and any leftover is removed first.
+    let dir = Path::new(STATE_PATH).parent().unwrap_or(Path::new(r"C:\ProgramData\rnetrbin"));
+    std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let file = dir.join(format!("auditpol-{}-{nanos}.csv", std::process::id()));
+    if file.exists() {
+        std::fs::remove_file(&file).map_err(|e| e.to_string())?;
+    }
     run(&tool("auditpol"), &["/backup".into(), format!("/file:{}", file.display())])?;
     let bytes = std::fs::read(&file).map_err(|e| e.to_string());
     let _ = std::fs::remove_file(&file);
@@ -132,8 +150,8 @@ fn current_setting() -> Result<u8, String> {
     parse_backup_setting(&csv, FILE_SYSTEM_SUBCATEGORY).ok_or_else(|| "auditpol backup has no File System line".to_string())
 }
 
-/// SID of the machine's primary domain, None in a workgroup.
-pub fn primary_domain_sid() -> Option<String> {
+/// SID of the machine's primary domain, Ok(None) in a workgroup, Err when LSA fails.
+pub fn primary_domain_sid() -> Result<Option<String>, String> {
     use windows::core::PWSTR;
     use windows::Win32::Foundation::{LocalFree, HLOCAL};
     use windows::Win32::Security::Authentication::Identity::{
@@ -144,14 +162,15 @@ pub fn primary_domain_sid() -> Option<String> {
     unsafe {
         let attrs = LSA_OBJECT_ATTRIBUTES::default();
         let mut policy = LSA_HANDLE::default();
-        if LsaOpenPolicy(None, &attrs, POLICY_VIEW_LOCAL_INFORMATION as u32, &mut policy).is_err() {
-            return None;
+        let st = LsaOpenPolicy(None, &attrs, POLICY_VIEW_LOCAL_INFORMATION as u32, &mut policy);
+        if st.is_err() {
+            return Err(format!("LsaOpenPolicy: {st:?}"));
         }
         let mut buf: *mut core::ffi::c_void = std::ptr::null_mut();
         let st = LsaQueryInformationPolicy(policy, PolicyPrimaryDomainInformation, &mut buf);
         let _ = LsaClose(policy);
         if st.is_err() || buf.is_null() {
-            return None;
+            return Err(format!("LsaQueryInformationPolicy: {st:?}"));
         }
         let info = &*(buf as *const POLICY_PRIMARY_DOMAIN_INFO);
         let mut out = None;
@@ -163,7 +182,7 @@ pub fn primary_domain_sid() -> Option<String> {
             }
         }
         let _ = LsaFreeMemory(Some(buf));
-        out
+        Ok(out)
     }
 }
 
@@ -175,7 +194,14 @@ pub fn ensure() -> Result<(), String> {
     let state = match std::fs::read_to_string(STATE_PATH).ok().and_then(|t| toml::from_str::<AuditState>(&t).ok()) {
         Some(state) => state,
         None => {
-            let sid = audit_users_sid(primary_domain_sid().as_deref());
+            let domain = primary_domain_sid().unwrap_or_else(|e| {
+                tracing::warn!("audit: cannot read the domain SID ({e}); falling back to BUILTIN\\Users");
+                None
+            });
+            let sid = audit_users_sid(domain.as_deref());
+            if domain.is_none() {
+                tracing::warn!("audit: auditing deletes of every local user (BUILTIN\\Users); more events in the log");
+            }
             let view = run(&tool("auditpol"), &sacl_view_args(&sid))?;
             let sacl_existed = parse_sacl_view_has_entry(&view);
             if sacl_existed && !sacl_view_has_delete(&view) {
@@ -209,6 +235,7 @@ pub fn status() -> AuditStatus {
     AuditStatus {
         policy_success: current_setting().map(|s| s & 1 != 0).unwrap_or(false),
         configured: Path::new(STATE_PATH).exists(),
+        builtin_users: std::fs::read_to_string(STATE_PATH).is_ok_and(|t| state_audits_builtin_users(&t)),
     }
 }
 
@@ -273,6 +300,13 @@ Comando executado com êxito.
         assert!(sacl_view_has_delete(SACL_ENTRY));
         assert!(!sacl_view_has_delete(&SACL_ENTRY.replace("DELETE", "WRITE_DAC")));
         assert!(!sacl_view_has_delete(SACL_NONE));
+    }
+
+    #[test]
+    fn state_tells_builtin_users_auditing() {
+        assert!(state_audits_builtin_users("policy_before = 0\nsacl_sid = \"S-1-5-32-545\"\nsacl_existed = false\n"));
+        assert!(!state_audits_builtin_users("policy_before = 0\nsacl_sid = \"S-1-5-21-1-2-3-513\"\n"));
+        assert!(!state_audits_builtin_users("garbage"));
     }
 
     #[test]

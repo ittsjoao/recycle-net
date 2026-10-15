@@ -6,6 +6,7 @@ use iced::{Alignment, Element, Length};
 
 use super::home::{group, ribbon_bar, ribbon_button};
 use super::{App, Msg};
+use crate::audit::setup::AuditStatus;
 use crate::config::{Config, FolderRule, ThemeName, CONFIG_PATH};
 use crate::install::SvcState;
 
@@ -70,6 +71,19 @@ impl Form {
     }
 }
 
+/// "Auditoria (quem apagou)" line of the settings tab.
+pub fn audit_text(a: &AuditStatus) -> &'static str {
+    if a.policy_success && a.builtin_users {
+        "ativa: exclusões de todos os usuários locais (servidor fora de domínio; mais eventos no log)"
+    } else if a.policy_success {
+        "ativa: exclusões de Usuários do Domínio, log de Segurança com 512 MB ou mais"
+    } else if a.configured {
+        "desligada (uma política de grupo pode ter sobrescrito); a coluna Usuário mostrará \"desconhecido\""
+    } else {
+        "ainda não configurada: o serviço configura ao iniciar"
+    }
+}
+
 /// Toast after "Iniciar o serviço com o Windows" was applied.
 pub fn autostart_done(on: bool) -> &'static str {
     if on {
@@ -110,13 +124,7 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
             .style(if app.theme == t { iced::widget::button::primary } else { iced::widget::button::secondary })
             .on_press(Msg::Theme(t))
     };
-    let audit = if app.audit.policy_success {
-        "ativa: exclusões de Usuários do Domínio, log de Segurança com 512 MB ou mais"
-    } else if app.audit.configured {
-        "desligada (uma política de grupo pode ter sobrescrito); a coluna Usuário mostrará \"desconhecido\""
-    } else {
-        "ainda não configurada: o serviço configura ao iniciar"
-    };
+    let audit = audit_text(&app.audit);
     let exe = std::env::current_exe().map(|e| e.display().to_string()).unwrap_or_default();
     column![
         ribbon,
@@ -189,5 +197,17 @@ mod tests {
         assert_eq!(c.max_age_days, None);
         assert!(Form { max_gb: "0".into(), ..f.clone() }.to_config(&[], ThemeName::Rust).is_err());
         assert!(Form { max_age_days: "x".into(), ..f }.to_config(&[], ThemeName::Rust).is_err());
+    }
+
+    #[test]
+    fn audit_text_warns_about_workgroup_auditing() {
+        let on = AuditStatus { policy_success: true, configured: true, builtin_users: false };
+        assert!(audit_text(&on).contains("Usuários do Domínio"));
+        assert_eq!(
+            audit_text(&AuditStatus { builtin_users: true, ..on }),
+            "ativa: exclusões de todos os usuários locais (servidor fora de domínio; mais eventos no log)"
+        );
+        assert!(audit_text(&AuditStatus { policy_success: false, ..on }).starts_with("desligada"));
+        assert!(audit_text(&AuditStatus::default()).starts_with("ainda não configurada"));
     }
 }
