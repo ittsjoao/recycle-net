@@ -459,8 +459,12 @@ impl App {
                 });
             }
             Msg::Refresh => {
+                let seq = self.toast_seq;
                 self.refresh();
-                self.notify("Lista atualizada.", Kind::Ok);
+                // Keep an index error from refresh() visible instead.
+                if self.toast_seq == seq {
+                    self.notify("Lista atualizada.", Kind::Ok);
+                }
             }
             Msg::SelectFolder(i) => self.folder_sel = Some(i),
             Msg::AddFolder => {

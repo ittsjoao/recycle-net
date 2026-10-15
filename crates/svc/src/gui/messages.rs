@@ -219,6 +219,22 @@ mod tests {
     }
 
     #[test]
+    fn populated_unmarked_recycle_dir_is_explained() {
+        let dir = std::env::temp_dir().join(format!("rnetrbin-msg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("other.txt"), b"x").unwrap();
+        let e = crate::config::ensure_dedicated_dir(&dir).unwrap_err();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(
+            config(&e),
+            format!(
+                "A pasta da lixeira {} já tem arquivos e não foi criada pelo rnetrbin; escolha uma pasta vazia.",
+                dir.display()
+            )
+        );
+    }
+
+    #[test]
     fn unknown_config_error_keeps_the_detail() {
         let e = crate::config::ConfigError::Invalid("something new".into());
         assert_eq!(config(&e), "Configuração inválida: something new.");
