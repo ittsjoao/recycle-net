@@ -11,13 +11,20 @@ No live reverse engineering or driver connection was performed as part of this t
   `FilterSendMessage(hPort, &cmd, 4, payload, payload_len, &returned)`.
 - Mask payload: nul-terminated UTF-16LE string.
 - SetupMonitor payload: `u8 bEnabled; u8 pad; u16 cbLogDir; WCHAR path[]`.
-  `cbLogDir` is the BYTE length of the UTF-16 path, without the `\??\` prefix (the driver prepends it) and without a nul.
+  `cbLogDir` is the BYTE length of the UTF-16 path, without the `\??\` prefix (the driver prepends it) and without the nul,
+  but the path MUST be nul-terminated: the driver copies it with `RtlAppendUnicodeToString` (reads to the nul, ignores
+  `cbLogDir`) into a buffer of exactly `cbLogDir + 8 + 2` bytes. Without the nul it reads past the payload, the append
+  fails and the target stays `\??\` while the monitor is enabled: deletes pass and nothing is copied (seen on a
+  Server 2019 install, 2026-10-15).
 - Backup temp suffix: `.nrbnew`. Completion flag file: `<name>.nrbnew.nrbflag` (as implemented in `finalize::flag_path`).
 
 ## Pending (not done here)
 
-1. Open `C:\Program Files (x86)\Server Network Recycle Bin Tool\snetrbinsrv.exe` in REA, find the
-   `FilterSendMessage` import and decompile its callers; confirm the InBuffer/OutBuffer mapping per call.
+1. Done (2026-10-15, REA + Ghidra 12.1.4): the port client is `drv.dll` (x86, loaded by `snetrbinsrv.exe`), exporting
+   `connectToDriver`, `clearDirItems`, `addInclMask`/`addExclMask` (cmd 0/1, `WCHAR[1024]` OutBuffer of 0x800 bytes,
+   nul-terminated), `setMonitorSetup` (cmd 3, 0x804-byte OutBuffer; it also runs `GetFullPathNameW` + `CreateDirectoryW`
+   on the dir) and `loadDriver` (`FilterLoad("netrbin")`). Command in InBuffer, payload in OutBuffer: confirmed. The
+   driver `MessageCallback` checks only `InputBufferLength > 3`, never the OutBuffer length.
 2. Confirm the exact flag file name/extension by finding the string the service searches for in the recycle dir.
 3. Record how the original stores its config (registry/ini) and its SQLite path.
 
