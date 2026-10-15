@@ -1,7 +1,7 @@
 //! "Configurações" tab (settings, service controls, credits).
 use std::path::PathBuf;
 
-use iced::widget::{button, column, row, text, text_input, Space};
+use iced::widget::{button, checkbox, column, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
 
 use super::home::{group, ribbon_bar, ribbon_button};
@@ -70,6 +70,15 @@ impl Form {
     }
 }
 
+/// Toast after "Iniciar o serviço com o Windows" was applied.
+pub fn autostart_done(on: bool) -> &'static str {
+    if on {
+        "O serviço vai iniciar junto com o Windows."
+    } else {
+        "O serviço não vai mais iniciar sozinho; use Iniciar."
+    }
+}
+
 pub(super) fn view(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
     let idle = !app.busy;
@@ -124,6 +133,14 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
             ]
             .spacing(6)
             .align_y(Alignment::Center),
+            row![
+                text("Inicialização").size(13).width(Length::Fixed(230.0)),
+                checkbox(app.autostart.unwrap_or(false))
+                    .label("Iniciar o serviço com o Windows")
+                    .text_size(13)
+                    .on_toggle_maybe((idle && app.autostart.is_some()).then_some(Msg::Autostart)),
+            ]
+            .align_y(Alignment::Center),
             row![text("Auditoria (quem apagou)").size(13).width(Length::Fixed(230.0)), text(audit).size(13)],
             text(format!(
                 "Configuração gravada em {CONFIG_PATH}. Salvar com o serviço rodando o reinicia. \
@@ -131,6 +148,7 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
             ))
             .size(12)
             .color(p.muted),
+            text("Fechar esta janela não para o serviço; a proteção continua rodando.").size(12).color(p.muted),
             Space::new().height(Length::Fill),
             text(format!("rnetrbin {} · Ícones: Material Icons, Google (Apache 2.0)", env!("CARGO_PKG_VERSION")))
                 .size(11)
@@ -145,6 +163,12 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn autostart_toast_says_what_happens_next() {
+        assert_eq!(autostart_done(true), "O serviço vai iniciar junto com o Windows.");
+        assert_eq!(autostart_done(false), "O serviço não vai mais iniciar sozinho; use Iniciar.");
+    }
 
     #[test]
     fn form_round_trips_config() {

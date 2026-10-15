@@ -32,6 +32,9 @@ pub fn run() -> iced::Result {
         .subscription(App::subscription)
         .font(icons::FONT_BYTES)
         .window_size((1150.0, 720.0))
+        // Closing waits for a running job (e.g. the stop+start of Salvar) so the
+        // service is never left stopped; see Msg::CloseRequested.
+        .exit_on_close_request(false)
         .run()
 }
 
@@ -76,9 +79,13 @@ pub enum Msg {
     Install,
     Start,
     Stop,
+    /// "Iniciar o serviço com o Windows" toggled.
+    Autostart(bool),
     Done(Result<String, String>),
     /// Hide toast `id` (its timer ran out, or the user closed it).
     ToastClose(u64),
+    /// The user closed the window. Only the window exits; the service keeps running.
+    CloseRequested,
 }
 
 pub struct App {
@@ -104,10 +111,14 @@ pub struct App {
     mods: keyboard::Modifiers,
     svc: SvcState,
     driver: SvcState,
+    /// Service start type is Automatic; None when not installed or unreadable.
+    autostart: Option<bool>,
     audit: AuditStatus,
     toast: Option<Toast>,
     toast_seq: u64,
     busy: bool,
+    /// Close was requested while busy: exit once the job reports back.
+    closing: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -187,10 +198,12 @@ impl App {
             mods: keyboard::Modifiers::default(),
             svc: SvcState::NotInstalled,
             driver: SvcState::NotInstalled,
+            autostart: None,
             audit: AuditStatus::default(),
             toast: None,
             toast_seq: 0,
             busy: false,
+            closing: false,
         };
         match Config::load(Path::new(CONFIG_PATH)) {
             Ok(c) => app.apply_config(&c),
@@ -228,6 +241,7 @@ impl App {
     fn subscription(&self) -> Subscription<Msg> {
         iced::event::listen_with(|event, _status, _window| match event {
             iced::Event::Keyboard(keyboard::Event::ModifiersChanged(m)) => Some(Msg::Modifiers(m)),
+            iced::Event::Window(iced::window::Event::CloseRequested) => Some(Msg::CloseRequested),
             _ => None,
         })
     }
@@ -250,6 +264,10 @@ impl App {
     fn refresh(&mut self) {
         self.svc = install::service_state(install::OWN_SERVICE).unwrap_or(SvcState::NotInstalled);
         self.driver = install::service_state(install::DRIVER_SERVICE).unwrap_or(SvcState::NotInstalled);
+        self.autostart = match self.svc {
+            SvcState::NotInstalled => None,
+            _ => install::service_autostart(install::OWN_SERVICE).ok(),
+        };
         self.audit = audit_setup::status();
         if let Some(idx) = &self.idx {
             match idx.all_versions() {
@@ -396,7 +414,7 @@ impl App {
     }
 
     fn handle(&mut self, msg: Msg) -> Task<Msg> {
-        if !matches!(msg, Msg::ConfirmRemove | Msg::Modifiers(_) | Msg::ToastClose(_)) {
+        if !matches!(msg, Msg::ConfirmRemove | Msg::Modifiers(_) | Msg::ToastClose(_) | Msg::CloseRequested) {
             self.confirm_remove = false;
         }
         match msg {
@@ -557,8 +575,21 @@ impl App {
                     install::stop_own_service().map(|_| "Serviço parado.".into()).map_err(|e| messages::service(&e))
                 });
             }
+            Msg::Autostart(on) => {
+                if self.busy {
+                    return Task::none();
+                }
+                self.busy = true;
+                return work(move || {
+                    install::set_service_autostart(install::OWN_SERVICE, on).map_err(|e| messages::service(&e))?;
+                    Ok(settings::autostart_done(on).into())
+                });
+            }
             Msg::Done(r) => {
                 self.busy = false;
+                if self.closing {
+                    return iced::exit();
+                }
                 match r {
                     Ok(s) => self.notify(s, Kind::Ok),
                     Err(e) => self.notify(e, Kind::Error),
@@ -569,6 +600,14 @@ impl App {
                 if self.toast.as_ref().is_some_and(|t| t.id == id) {
                     self.toast = None;
                 }
+            }
+            // Nothing here touches the SCM: the service is its own process.
+            Msg::CloseRequested => {
+                if !self.busy {
+                    return iced::exit();
+                }
+                self.closing = true;
+                self.notify("Terminando a operação em andamento; a janela fecha em seguida.", Kind::Info);
             }
         }
         Task::none()

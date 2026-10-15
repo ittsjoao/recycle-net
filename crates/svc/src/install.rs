@@ -159,6 +159,50 @@ pub fn start_service(name: &str) -> Result<(), String> {
     }
 }
 
+/// Whether an SCM start type means the service starts with Windows
+/// (Automatic; "delayed" is a separate flag on the same start type).
+fn is_autostart(start_type: u32) -> bool {
+    start_type == windows::Win32::System::Services::SERVICE_AUTO_START.0
+}
+
+/// Whether the service starts with Windows (SCM start type is Automatic).
+pub fn service_autostart(name: &str) -> Result<bool, String> {
+    use windows::Win32::System::Services::*;
+    let s = win::open(name, SERVICE_QUERY_CONFIG)?.ok_or_else(|| format!("{name} is not installed"))?;
+    let mut needed = 0u32;
+    // First call only sizes the buffer (fails with ERROR_INSUFFICIENT_BUFFER).
+    let _ = unsafe { QueryServiceConfigW(s.svc, None, 0, &mut needed) };
+    // u64 storage keeps the struct (pointers inside) aligned.
+    let mut buf = vec![0u64; (needed as usize).div_ceil(8).max(1)];
+    let cfg = buf.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW;
+    unsafe { QueryServiceConfigW(s.svc, Some(cfg), (buf.len() * 8) as u32, &mut needed) }
+        .map_err(|e| format!("query config {name}: {e}"))?;
+    Ok(is_autostart(unsafe { (*cfg).dwStartType }.0))
+}
+
+/// Switch the service between Automatic (`on`) and Manual start; nothing else changes.
+pub fn set_service_autostart(name: &str, on: bool) -> Result<(), String> {
+    use windows::Win32::System::Services::*;
+    let s = win::open(name, SERVICE_CHANGE_CONFIG)?.ok_or_else(|| format!("{name} is not installed"))?;
+    let start = if on { SERVICE_AUTO_START } else { SERVICE_DEMAND_START };
+    unsafe {
+        ChangeServiceConfigW(
+            s.svc,
+            ENUM_SERVICE_TYPE(SERVICE_NO_CHANGE),
+            start,
+            SERVICE_ERROR(SERVICE_NO_CHANGE),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+    }
+    .map_err(|e| format!("change config {name}: {e}"))
+}
+
 /// Stop `rnetrbin-svc` and wait for it; not running is Ok.
 pub fn stop_own_service() -> Result<(), String> {
     win::stop(OWN_SERVICE, OWN_STOP_TIMEOUT)
@@ -498,6 +542,15 @@ mod tests {
         assert!(read_driver_override(&driver_file(&d, "a.sys", b"PK..")).is_err());
         assert!(read_driver_override(&d.path().join("missing.sys")).is_err());
         assert_eq!(read_driver_override(&driver_file(&d, "netrbin.SYS", b"MZ\x90\x00")).unwrap(), b"MZ\x90\x00");
+    }
+
+    #[test]
+    fn only_automatic_start_type_is_autostart() {
+        use windows::Win32::System::Services::*;
+        assert!(is_autostart(SERVICE_AUTO_START.0));
+        for t in [SERVICE_DEMAND_START, SERVICE_DISABLED, SERVICE_BOOT_START, SERVICE_SYSTEM_START] {
+            assert!(!is_autostart(t.0));
+        }
     }
 
     #[test]
