@@ -554,7 +554,11 @@ impl App {
                 }
             }
             Msg::Field(f, v) => self.form.set(f, v),
-            Msg::Theme(t) => self.theme = t,
+            Msg::Theme(t) => {
+                // Only the theme goes to disk; other unsaved fields stay unsaved.
+                self.theme = t;
+                settings::save_theme(Path::new(CONFIG_PATH), t);
+            }
             Msg::Save => return self.save_config().unwrap_or_else(Task::none),
             Msg::Install => {
                 let Some(task) = self.save_config() else { return Task::none() };

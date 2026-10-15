@@ -1,5 +1,5 @@
 //! "Configurações" tab (settings, service controls, credits).
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use iced::widget::{button, checkbox, column, row, text, text_input, Space};
 use iced::{Alignment, Element, Length};
@@ -27,6 +27,12 @@ pub struct Form {
     pub db_path: String,
     pub max_gb: String,
     pub max_age_days: String,
+    /// `max_bin_bytes` as loaded: kept on save while `max_gb` still shows it.
+    pub orig_bytes: u64,
+}
+
+fn fmt_gb(bytes: u64) -> String {
+    format!("{}", (bytes as f64 / GB * 100.0).round() / 100.0)
 }
 
 impl Form {
@@ -34,8 +40,9 @@ impl Form {
         Form {
             recycle_dir: c.recycle_dir.display().to_string(),
             db_path: c.db_path.display().to_string(),
-            max_gb: format!("{}", (c.max_bin_bytes as f64 / GB * 100.0).round() / 100.0),
+            max_gb: fmt_gb(c.max_bin_bytes),
             max_age_days: c.max_age_days.map(|d| d.to_string()).unwrap_or_default(),
+            orig_bytes: c.max_bin_bytes,
         }
     }
 
@@ -63,11 +70,24 @@ impl Form {
         Ok(Config {
             recycle_dir: PathBuf::from(self.recycle_dir.trim()),
             db_path: PathBuf::from(self.db_path.trim()),
-            max_bin_bytes: (gb * GB) as u64,
+            // The GB text is rounded; an untouched field keeps a hand-set byte value.
+            max_bin_bytes: if self.max_gb.trim() == fmt_gb(self.orig_bytes) { self.orig_bytes } else { (gb * GB) as u64 },
             max_age_days,
             theme,
             folders: folders.to_vec(),
         })
+    }
+}
+
+/// Write only `theme` into the config at `path` (the service ignores it, so no restart).
+/// False when the file is missing or invalid: the theme then applies in memory only.
+pub fn save_theme(path: &Path, theme: ThemeName) -> bool {
+    match Config::load(path) {
+        Ok(mut c) => {
+            c.theme = theme;
+            c.save(path).is_ok()
+        }
+        Err(_) => false,
     }
 }
 
@@ -200,6 +220,16 @@ mod tests {
     }
 
     #[test]
+    fn form_keeps_a_hand_set_byte_limit_unless_the_gb_text_changes() {
+        let c = Config { max_bin_bytes: 10_000_000_123, ..Config::default() };
+        let f = Form::from_config(&c);
+        assert_eq!(f.to_config(&[], ThemeName::Rust).unwrap().max_bin_bytes, 10_000_000_123);
+        let mut g = f.clone();
+        g.set(Field::MaxGb, "2".into());
+        assert_eq!(g.to_config(&[], ThemeName::Rust).unwrap().max_bin_bytes, (2.0 * GB) as u64);
+    }
+
+    #[test]
     fn audit_text_warns_about_workgroup_auditing() {
         let on = AuditStatus { policy_success: true, configured: true, builtin_users: false };
         assert!(audit_text(&on).contains("Usuários do Domínio"));
@@ -209,5 +239,19 @@ mod tests {
         );
         assert!(audit_text(&AuditStatus { policy_success: false, ..on }).starts_with("desligada"));
         assert!(audit_text(&AuditStatus::default()).starts_with("ainda não configurada"));
+    }
+
+    #[test]
+    fn save_theme_writes_only_the_theme_and_never_creates_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        assert!(!save_theme(&path, ThemeName::Preto));
+        assert!(!path.exists());
+        let mut c = Config { max_age_days: Some(7), folders: vec![FolderRule::with_defaults(r"D:\Dados".into())], ..Config::default() };
+        c.save(&path).unwrap();
+        assert!(save_theme(&path, ThemeName::Preto));
+        assert_eq!(Config::load(&path).unwrap(), Config { theme: ThemeName::Preto, ..c });
+        std::fs::write(&path, "not toml [").unwrap();
+        assert!(!save_theme(&path, ThemeName::Branco));
     }
 }
