@@ -65,6 +65,21 @@ the code if wrong (see also docs/notes/port-protocol-confirmation.md):
 15. Config made invalid after a persisted takeover, then restart: the service
     restores SNetRBin on the early-exit path.
 
+## Rules and deleted-by
+16. Rules: folder with Include `*.*` and Exclude `*.bak`; deleting `a.docx` and `a.bak`
+    over SMB keeps only `a.docx`, also in a subfolder.
+17. Deleted-by: the list shows `DOMAIN\user` of the SMB user within ~10 s of the delete;
+    with File System auditing turned off by `auditpol`, the backup still appears and the
+    user shows "desconhecido".
+18. Large folder: protecting a folder with ~1M files is immediate (no per-file ACL
+    rewrite; `auditpol /resourceSACL /type:File /view` shows the DELETE entry).
+19. `uninstall` restores the previous File System audit setting and removes the global
+    SACL entry (unless `sacl_existed` was true in `audit-state.toml`: then it stays);
+    the Security log size stays.
+20. Removing the last protected folder in the window: the list shows the empty text,
+    saving works, and a delete over SMB captures nothing. "Instalar" with zero
+    folders is refused.
+
 ## Run
 `cargo test -p rnetrbin-svc --test e2e -- --ignored` (skeleton; implement against the VM) and
 `cargo test -p rnetrbin-svc --test port_live -- --ignored`.
