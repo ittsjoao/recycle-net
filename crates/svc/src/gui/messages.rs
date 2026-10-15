@@ -1,6 +1,5 @@
 //! Plain pt-BR text for the errors the window shows (toasts).
 use crate::config::ConfigError;
-use crate::install::InstallError;
 use crate::restore::RestoreError;
 use crate::retention::RetentionError;
 
@@ -110,26 +109,6 @@ pub fn service(raw: &str) -> String {
     } else {
         let detail = raw.split_once(": ").map_or(raw, |(_, d)| d);
         format!("O serviço do Windows recusou a operação: {}.", clean(detail))
-    }
-}
-
-pub fn install(e: &InstallError) -> String {
-    match e {
-        InstallError::Step { step, msg } => {
-            let low = msg.to_lowercase();
-            if low.contains("0x80070005") || low.contains("acesso negado") || low.contains("access is denied") {
-                return service(msg);
-            }
-            let what = match *step {
-                "copy driver" => "copiar o driver",
-                "register driver" => "registrar o driver",
-                "load driver" => "carregar o driver (o Windows pode estar bloqueando drivers antigos)",
-                "register service" => "registrar o serviço",
-                s => s,
-            };
-            format!("A instalação parou ao {what}: {}.", clean(msg))
-        }
-        InstallError::Source(p, m) => format!("Driver inválido em {}: {}.", p.display(), clean(m)),
     }
 }
 

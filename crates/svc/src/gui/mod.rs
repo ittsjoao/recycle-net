@@ -78,7 +78,6 @@ pub enum Msg {
     Field(settings::Field, String),
     Theme(ThemeName),
     Save,
-    Install,
     Start,
     Stop,
     /// "Iniciar o serviço com o Windows" toggled.
@@ -177,6 +176,18 @@ fn summary(done: &str, n: usize, errs: Vec<String>) -> Result<String, String> {
     }
 }
 
+/// Tab the window opens on: first use (no protected folder) goes to Pastas
+/// protegidas; a missing service to Configurações, which says to reinstall.
+fn initial_tab(no_folders: bool, svc: SvcState) -> Tab {
+    if no_folders {
+        Tab::Pastas
+    } else if svc == SvcState::NotInstalled {
+        Tab::Config
+    } else {
+        Tab::Inicio
+    }
+}
+
 impl App {
     fn new() -> (App, Task<Msg>) {
         let mut app = App {
@@ -216,13 +227,14 @@ impl App {
                 app.notify(format!("{} Corrija em Configurações.", messages::config(&e)), Kind::Error)
             }
             Err(_) => app.notify(
-                "Primeiro uso: adicione as pastas em Pastas protegidas e instale em Configurações.",
-                Kind::Info,
+                format!("Configuração {CONFIG_PATH} não encontrada. Reinstale o rnetrbin pelo setup."),
+                Kind::Error,
             ),
         }
         app.refresh();
-        if app.svc == SvcState::NotInstalled {
-            app.tab = Tab::Config;
+        app.tab = initial_tab(app.folders.is_empty(), app.svc);
+        if app.tab == Tab::Pastas && app.toast.is_none() {
+            app.notify("Primeiro uso: adicione as pastas a proteger e clique em Salvar em Configurações.", Kind::Info);
         }
         let task = app.toast.as_ref().map_or_else(Task::none, |t| expire(t.id, t.kind));
         (app, task)
@@ -560,23 +572,6 @@ impl App {
                 settings::save_theme(Path::new(CONFIG_PATH), t);
             }
             Msg::Save => return self.save_config().unwrap_or_else(Task::none),
-            Msg::Install => {
-                let Some(task) = self.save_config() else { return Task::none() };
-                if self.busy {
-                    // A service restart is in flight; never install over it.
-                    return task;
-                }
-                self.busy = true;
-                return work(|| {
-                    let exe = std::env::current_exe().map_err(|e| {
-                        format!("Não foi possível localizar o executável: {}.", messages::clean(&e.to_string()))
-                    })?;
-                    install::install(&install::WinHost, install::EMBEDDED_DRIVER, &exe)
-                        .map_err(|e| messages::install(&e))?;
-                    install::start_service(install::OWN_SERVICE).map_err(|e| messages::service(&e))?;
-                    Ok(format!("Instalado e iniciado. O serviço usa {}; não mova este arquivo.", exe.display()))
-                });
-            }
             Msg::Start => {
                 self.busy = true;
                 return work(|| {
@@ -740,5 +735,19 @@ impl App {
         .width(Length::Fill)
         .style(theme::surface(p, p.panel))
         .into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn first_use_opens_protected_folders_then_settings_when_not_installed() {
+        assert_eq!(initial_tab(true, SvcState::NotInstalled), Tab::Pastas);
+        assert_eq!(initial_tab(true, SvcState::Running), Tab::Pastas);
+        assert_eq!(initial_tab(false, SvcState::NotInstalled), Tab::Config);
+        assert_eq!(initial_tab(false, SvcState::Running), Tab::Inicio);
+        assert_eq!(initial_tab(false, SvcState::Stopped), Tab::Inicio);
     }
 }

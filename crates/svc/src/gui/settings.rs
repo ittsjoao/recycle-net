@@ -104,6 +104,18 @@ pub fn audit_text(a: &AuditStatus) -> &'static str {
     }
 }
 
+/// Note under the settings: where the config lives, or how to get the service back.
+pub fn service_note(svc: SvcState, exe: &str) -> String {
+    if svc == SvcState::NotInstalled {
+        "Serviço não instalado. Reinstale o rnetrbin pelo setup.".into()
+    } else {
+        format!(
+            "Configuração gravada em {CONFIG_PATH}. Salvar com o serviço rodando o reinicia. \
+             O serviço usa {exe}; não mova este arquivo."
+        )
+    }
+}
+
 /// Toast after "Iniciar o serviço com o Windows" was applied.
 pub fn autostart_done(on: bool) -> &'static str {
     if on {
@@ -116,8 +128,6 @@ pub fn autostart_done(on: bool) -> &'static str {
 pub(super) fn view(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
     let idle = !app.busy;
-    // Installing with no protected folder would start a service that guards nothing.
-    let can_install = idle && app.svc == SvcState::NotInstalled && !app.folders.is_empty();
     let ribbon = ribbon_bar(
         p,
         vec![
@@ -125,7 +135,6 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
             group(
                 p,
                 row![
-                    ribbon_button(p, "install_desktop", "Instalar", can_install.then_some(Msg::Install), false),
                     ribbon_button(p, "play_circle", "Iniciar", (idle && app.svc == SvcState::Stopped).then_some(Msg::Start), false),
                     ribbon_button(p, "stop_circle", "Parar", (idle && app.svc == SvcState::Running).then_some(Msg::Stop), true),
                 ]
@@ -170,12 +179,7 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
             ]
             .align_y(Alignment::Center),
             row![text("Auditoria (quem apagou)").size(13).width(Length::Fixed(230.0)), text(audit).size(13)],
-            text(format!(
-                "Configuração gravada em {CONFIG_PATH}. Salvar com o serviço rodando o reinicia. \
-                 Instalar registra o serviço apontando para {exe}; não mova este arquivo depois."
-            ))
-            .size(12)
-            .color(p.muted),
+            text(service_note(app.svc, &exe)).size(12).color(if app.svc == SvcState::NotInstalled { p.danger } else { p.muted }),
             text("Fechar esta janela não para o serviço; a proteção continua rodando.").size(12).color(p.muted),
             Space::new().height(Length::Fill),
             text(format!("rnetrbin {} · Ícones: Material Icons, Google (Apache 2.0)", env!("CARGO_PKG_VERSION")))
@@ -191,6 +195,14 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn not_installed_service_points_to_the_setup() {
+        assert_eq!(service_note(SvcState::NotInstalled, r"C:\x.exe"), "Serviço não instalado. Reinstale o rnetrbin pelo setup.");
+        let n = service_note(SvcState::Running, r"C:\Arquivos\rnetrbin-svc.exe");
+        assert!(n.contains(r"C:\Arquivos\rnetrbin-svc.exe"));
+        assert!(!n.contains("Instalar"));
+    }
 
     #[test]
     fn autostart_toast_says_what_happens_next() {

@@ -1,10 +1,10 @@
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rnetrbin_svc::config::{Config, CONFIG_PATH};
+use rnetrbin_svc::config::{self, Config, CONFIG_PATH};
 use rnetrbin_svc::{install, service};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
@@ -137,35 +137,64 @@ fn run_console(takeover: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-/// `install [--driver <netrbin.sys>]`: installs the embedded driver unless
-/// overridden. The config must already be valid, so the service never starts
-/// against a config it would reject.
-fn run_install(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
-    let driver = match args.iter().position(|a| a == "--driver") {
-        Some(i) => {
-            let p = args.get(i + 1).ok_or("usage: rnetrbin-svc install [--driver <path\\to\\netrbin.sys>]")?;
-            Some(install::read_driver_override(Path::new(p))?)
-        }
-        None => None,
-    };
-    Config::load(Path::new(CONFIG_PATH)).map_err(|e| format!("config {CONFIG_PATH}: {e}"))?;
-    let exe = std::env::current_exe()?;
-    install::install(&install::WinHost, driver.as_deref().unwrap_or(install::EMBEDDED_DRIVER), &exe)?;
-    println!("installed; start with: sc.exe start {SERVICE_NAME}");
+/// `init-config --recycle-dir <dir>`: run by the setup before `install`. Writes
+/// a config with zero protected folders unless one already exists (upgrade).
+fn run_init_config(args: &[String]) -> Result<(), String> {
+    let dir = args
+        .iter()
+        .position(|a| a == "--recycle-dir")
+        .and_then(|i| args.get(i + 1))
+        .ok_or(r"uso: rnetrbin-svc init-config --recycle-dir <pasta, ex. D:\RecycleBinNet>")?;
+    match config::init_config(Path::new(CONFIG_PATH), Path::new(dir)) {
+        Ok(config::InitConfig::Created) => println!("configuração criada em {CONFIG_PATH} (lixeira em {dir}, nenhuma pasta protegida)"),
+        Ok(config::InitConfig::AlreadyExists) => println!("configuração já existe em {CONFIG_PATH}; mantida"),
+        Err(e) => return Err(format!("Não foi possível criar a configuração {CONFIG_PATH}.\nDetalhe técnico: {e}")),
+    }
     Ok(())
 }
 
-fn run_uninstall(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
+/// `install [--driver <netrbin.sys>] [--exe <rnetrbin-svc.exe>]`: installs the
+/// embedded driver unless overridden and points the service at `--exe` (default: this exe). The config must already be valid, so the service never starts
+/// against a config it would reject. Errors come back as pt-BR text for humans.
+fn run_install(args: &[String]) -> Result<(), String> {
+    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+    let driver = match args.iter().position(|a| a == "--driver") {
+        Some(i) => {
+            let p = args.get(i + 1).ok_or(r"uso: rnetrbin-svc install [--driver <caminho\netrbin.sys>]")?;
+            Some(install::read_driver_override(Path::new(p)).map_err(|e| install::describe(&e))?)
+        }
+        None => None,
+    };
+    Config::load(Path::new(CONFIG_PATH))
+        .map_err(|e| format!("A configuração {CONFIG_PATH} está ausente ou inválida.\nDetalhe técnico: {e}"))?;
+    // The setup runs a copy from its temp dir, so the service path comes from --exe.
+    let exe = match args.iter().position(|a| a == "--exe") {
+        Some(i) => args.get(i + 1).map(PathBuf::from).ok_or(r"uso: rnetrbin-svc install [--exe <caminho\rnetrbin-svc.exe>]")?,
+        None => std::env::current_exe().map_err(|e| format!("Não foi possível localizar o executável: {e}"))?,
+    };
+    println!("instalando o driver e o serviço (serviço aponta para {})", exe.display());
+    let image = driver.as_deref().unwrap_or(install::EMBEDDED_DRIVER);
+    let done = install::install(&install::WinHost, image, driver.is_some(), &exe).map_err(|e| install::describe(&e))?;
+    if done.reused_driver {
+        println!("usando o driver já instalado ({})", install::drivers_dir().join(install::DRIVER_FILE).display());
+    }
+    if done.reenabled_driver {
+        println!("driver netrbin estava desativado; reativado com início no boot (Start=0)");
+    }
+    println!("driver carregado e serviço registrado; inicie com: sc.exe start {SERVICE_NAME}");
+    Ok(())
+}
+
+fn run_uninstall(args: &[String]) -> Result<(), String> {
     let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
     let keep = args.iter().any(|a| a == "--keep-driver");
-    match install::uninstall(&install::WinHost, keep)? {
-        install::Uninstalled::DriverKept => println!("service removed; netrbin driver kept"),
-        install::Uninstalled::DriverRemoved => println!("service and netrbin driver removed"),
-        install::Uninstalled::RebootRequired => println!("service removed; reboot to finish removing the driver"),
+    match install::uninstall(&install::WinHost, keep).map_err(|e| install::describe(&e))? {
+        install::Uninstalled::DriverKept => println!("serviço removido; driver netrbin mantido"),
+        install::Uninstalled::DriverRemoved => println!("serviço e driver netrbin removidos"),
+        install::Uninstalled::RebootRequired => println!("serviço removido; reinicie para terminar de remover o driver"),
     }
     if let Err(e) = rnetrbin_svc::audit::setup::undo() {
-        eprintln!("warning: could not undo audit settings: {e}");
+        eprintln!("aviso: não foi possível desfazer a configuração de auditoria: {e}");
     }
     Ok(())
 }
@@ -237,7 +266,7 @@ fn main() {
         }
         return;
     }
-    let cli = matches!(args.get(1).map(String::as_str), Some("install" | "uninstall" | "--console"));
+    let cli = matches!(args.get(1).map(String::as_str), Some("install" | "uninstall" | "init-config" | "--console"));
     if !cli {
         if let Err(e) = run_gui() {
             init_file_logging();
@@ -249,11 +278,12 @@ fn main() {
     let sub = match args.get(1).map(String::as_str) {
         Some("install") => Some(run_install(&args)),
         Some("uninstall") => Some(run_uninstall(&args)),
+        Some("init-config") => Some(run_init_config(&args)),
         _ => None,
     };
     if let Some(res) = sub {
         if let Err(e) = res {
-            eprintln!("error: {e}");
+            eprintln!("ERRO: {e}");
             std::process::exit(1);
         }
         return;
