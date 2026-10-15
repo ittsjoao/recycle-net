@@ -13,9 +13,9 @@ conversa com o minifilter de terceiro `netrbin.sys` (produto licenciado) pela po
 - instalar (admin): config em `C:\ProgramData\rnetrbin\config.toml` (ver `config.example.toml`),
   `rnetrbin-svc.exe install` (`--driver <sys>` sobrescreve o embutido), `sc.exe start rnetrbin-svc`;
   remover com `uninstall [--keep-driver]`
-- janela: abrir o exe sem argumentos (pede UAC). Abas Inicio (arvore da lixeira e lista), Pastas
-  protegidas (regras Incluir/Excluir) e Configuracoes (instalar/iniciar/parar, tema). SCM: `--service`
-- console: `--console` (sem tocar SCM) ou `--console --takeover` (sempre 1o argumento)
+- janela: exe sem argumentos (pede UAC); abas Inicio, Pastas protegidas (Incluir/Excluir) e Configuracoes
+  (servico, iniciar com o Windows, tema). SCM: `--service`; console: `--console [--takeover]` (1o argumento)
+- instalador (uso interno, nao publicar): `installer/build.ps1` -> `target\installer\rnetrbin-setup-<versao>.exe`
 
 ## Convencoes que nao se deduzem do codigo
 
