@@ -17,8 +17,13 @@ pub fn match_event(deleted_utc: i64, events: &[DeleteEvent]) -> Option<&DeleteEv
 /// Give recent rows without a user the user of their matching event.
 /// Returns how many rows were filled.
 pub fn fill_pending(idx: &Index, now: i64) -> rusqlite::Result<usize> {
+    fill_since(idx, now - PENDING_SECS)
+}
+
+/// Like `fill_pending`, for rows deleted at or after `since` (startup catch-up pass).
+pub fn fill_since(idx: &Index, since: i64) -> rusqlite::Result<usize> {
     let mut filled = 0;
-    for (id, path, utc) in idx.pending_attribution(now - PENDING_SECS)? {
+    for (id, path, utc) in idx.pending_attribution(since)? {
         let events = idx.events_for(&path, utc - WINDOW_SECS, utc + WINDOW_SECS)?;
         if let Some(e) = match_event(utc, &events) {
             idx.set_user(id, &e.user, &e.sid)?;
@@ -72,5 +77,34 @@ mod tests {
         idx.add_delete_event(&DeleteEvent { path: "D:\\A\\x.txt".into(), user: "u".into(), sid: "s".into(), utc: 1000 }).unwrap();
         assert_eq!(fill_pending(&idx, 1000 + PENDING_SECS + 1).unwrap(), 0);
         assert_eq!(fill_pending(&idx, 1000 + PENDING_SECS).unwrap(), 1);
+    }
+
+    #[test]
+    fn fill_since_reaches_rows_older_than_the_pending_window() {
+        let idx = Index::open_memory().unwrap();
+        let id = add(&idx, "D:\\A\\x.txt", 1000);
+        idx.add_delete_event(&DeleteEvent { path: "D:\\A\\x.txt".into(), user: "ana".into(), sid: "s".into(), utc: 1002 }).unwrap();
+        // A restart after more than PENDING_SECS: the normal pass skips the row...
+        assert_eq!(fill_pending(&idx, 1000 + 3600).unwrap(), 0);
+        // ...the startup pass over a longer window attributes it.
+        assert_eq!(fill_since(&idx, 1001).unwrap(), 0, "row older than since");
+        assert_eq!(fill_since(&idx, 1000).unwrap(), 1);
+        let v = idx.all_versions().unwrap();
+        assert_eq!(v.iter().find(|x| x.id == id).unwrap().user_name.as_deref(), Some("ana"));
+    }
+
+    #[test]
+    fn two_backups_of_same_path_each_get_their_nearest_event() {
+        let idx = Index::open_memory().unwrap();
+        let a = add(&idx, "D:\\A\\x.txt", 1000);
+        let b = add(&idx, "D:\\A\\x.txt", 1050);
+        for (user, utc) in [("ana", 1003), ("bia", 1052)] {
+            idx.add_delete_event(&DeleteEvent { path: "D:\\A\\x.txt".into(), user: user.into(), sid: "s".into(), utc }).unwrap();
+        }
+        assert_eq!(fill_pending(&idx, 1060).unwrap(), 2);
+        let v = idx.all_versions().unwrap();
+        let user = |id| v.iter().find(|x| x.id == id).unwrap().user_name.clone();
+        assert_eq!(user(a).as_deref(), Some("ana"));
+        assert_eq!(user(b).as_deref(), Some("bia"));
     }
 }

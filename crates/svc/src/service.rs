@@ -476,7 +476,7 @@ pub fn run(
     take_over_original: bool,
 ) -> Result<(), ServiceError> {
     let mut driver = WinDriver::new(&cfg);
-    let audit = crate::audit::spawn(&cfg, stop.clone());
+    let audit = crate::audit::spawn(&cfg, stop.clone(), take_over_original);
     let s2 = stop.clone();
     let sleep = move |d: Duration| sleep_interruptible(d, &s2);
     let res = if take_over_original {
