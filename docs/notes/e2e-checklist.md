@@ -5,12 +5,25 @@ Status: PENDING. Never run on a production workstation: the port is single-clien
 ## VM setup
 Two topologies; run the cases on both when possible.
 - **Standalone (target):** the original product is NOT installed. The driver is
-  embedded in the exe at build time; write the config, then from an elevated prompt:
-  `rnetrbin-svc.exe install` and `sc.exe start rnetrbin-svc`.
+  embedded in the exe at build time; run the setup (it writes the config and installs
+  everything), or by hand from an elevated prompt: `rnetrbin-svc.exe init-config
+  --recycle-dir <dir>`, `rnetrbin-svc.exe install` and `sc.exe start rnetrbin-svc`.
 - **Coexisting:** original product installed (`SNetRBin` present); `install` reuses the
   driver and the service takes over SNetRBin at start.
 - A data volume plus an SMB share on it.
 - `C:\ProgramData\rnetrbin\config.toml` based on `config.example.toml`.
+
+## Setup
+N1. First install asks for "Pasta da lixeira" (default `C:\RecycleBinNet`, refuses a
+    populated folder) and writes `config.toml` with zero folders; an upgrade keeps the
+    config and does not show the page.
+N2. O setup registra e inicia o serviço: after Concluir, `sc query rnetrbin-svc` is
+    RUNNING, `fltmc` lists `netrbin`, and the window opens on Pastas protegidas.
+N3. A failing `install` (e.g. driver stuck STOP_PENDING) shows the pt-BR message with the
+    detail, stops on the Preparing page, copies no file and leaves no `rnetrbin-svc`;
+    `C:\ProgramData\rnetrbin\setup.log` has the full output.
+N4. Upgrade with the service running: it is stopped, `install` re-runs, and it is
+    started again; a service the user had stopped stays stopped.
 
 ## Install / uninstall (standalone)
 I1. `install` creates `netrbin` (Type=2, Start=0, Group=Filter, ErrorControl=0) with
@@ -24,6 +37,8 @@ I6. `uninstall` without SNetRBin: service gone, `netrbin` unloaded, service key 
     `System32\drivers\netrbin.sys` removed (or "reboot required" and gone after reboot).
 I7. `uninstall` with SNetRBin installed (or `--keep-driver`): only our service is removed;
     SNetRBin is back to its original start type and running.
+I8. Coexisting `install`: SNetRBin's `netrbin.sys` is not rewritten ("usando o driver já
+    instalado"); a `netrbin` left at Start=4 is set back to 0 ("reativado").
 
 ## Cases
 1. Large file (multiple 64KB chunks, > 128KB) deleted over SMB: finalized backup plus SQLite row appear; restore by id matches bytes.
@@ -77,8 +92,7 @@ the code if wrong (see also docs/notes/port-protocol-confirmation.md):
     SACL entry (unless `sacl_existed` was true in `audit-state.toml`: then it stays);
     the Security log size stays.
 20. Removing the last protected folder in the window: the list shows the empty text,
-    saving works, and a delete over SMB captures nothing. "Instalar" with zero
-    folders is refused.
+    saving works, and a delete over SMB captures nothing.
 
 ## Run
 `cargo test -p rnetrbin-svc --test e2e -- --ignored` (skeleton; implement against the VM) and
