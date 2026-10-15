@@ -40,7 +40,7 @@ pub(super) fn ribbon_button<'a>(p: Pal, icon: &str, caption: &'a str, msg: Optio
 /// A ribbon group: content centered vertically in a fixed-height band, the
 /// caption under it on the same baseline as every other group's.
 pub(super) fn group<'a>(p: Pal, content: impl Into<Element<'a, Msg>>, caption: &'a str) -> Element<'a, Msg> {
-    column![container(content).center_y(Length::Fixed(BTN_H)), label(caption, 11).color(p.muted)]
+    column![container(content).center_y(Length::Fixed(BTN_H)), label(caption, 11).font(BOLD).color(p.muted)]
         .spacing(2)
         .align_x(Alignment::Center)
         .padding([4, 10])
