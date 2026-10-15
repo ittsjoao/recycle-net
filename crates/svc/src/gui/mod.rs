@@ -234,7 +234,7 @@ impl App {
         app.refresh();
         app.tab = initial_tab(app.folders.is_empty(), app.svc);
         if app.tab == Tab::Pastas && app.toast.is_none() {
-            app.notify("Primeiro uso: adicione as pastas a proteger e clique em Salvar em Configurações.", Kind::Info);
+            app.notify("Primeiro uso: clique em Adicionar pasta, escolha a pasta e confirme as máscaras em Salvar; a proteção começa na hora.", Kind::Info);
         }
         let task = app.toast.as_ref().map_or_else(Task::none, |t| expire(t.id, t.kind));
         (app, task)
