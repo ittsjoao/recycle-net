@@ -9,8 +9,7 @@ conversa com o minifilter de terceiro `netrbin.sys` (produto licenciado) pela po
 
 - build: `cargo build --release` -> `target/release/rnetrbin-svc.exe` (embute o driver; exige
   `driver/netrbin.sys` ou `RNETRBIN_DRIVER`, copiado de `C:\Windows\System32\drivers`)
-- testes: `cargo test` (unitarios, sem driver/SCM) e `cargo clippy --all-targets`
-- testes com driver: `cargo test -p rnetrbin-svc --test port_live -- --ignored` (so VM)
+- testes: `cargo test` e `cargo clippy --all-targets` (sem driver/SCM); com driver (so VM): `cargo test -p rnetrbin-svc --test port_live -- --ignored`
 - instalar (admin): config em `C:\ProgramData\rnetrbin\config.toml` (ver `config.example.toml`),
   `rnetrbin-svc.exe install` (`--driver <sys>` sobrescreve o embutido), `sc.exe start rnetrbin-svc`;
   remover com `uninstall [--keep-driver]`
