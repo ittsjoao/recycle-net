@@ -82,6 +82,11 @@ var
   { `install` succeeded in PrepareToInstall / the files were copied. }
   Installed: Boolean;
   FilesDone: Boolean;
+  { This run wrote the config (deleted again unless the install completes, so the
+    "Pasta da lixeira" page comes back next time). }
+  CreatedConfig: Boolean;
+  { The netrbin driver service existed before this setup touched anything. }
+  DriverExisted: Boolean;
   BinPage: TInputDirWizardPage;
 
 procedure AppendSetupLog(const Text: String);
@@ -104,7 +109,7 @@ var
 begin
   Output := '';
   try
-    if ExecAndCaptureOutput(Exe, Params, '', SW_SHOWNORMAL, ewWaitUntilTerminated, Code, O) then
+    if ExecAndCaptureOutput(Exe, Params, '', SW_HIDE, ewWaitUntilTerminated, Code, O) then
     begin
       for I := 0 to GetArrayLength(O.StdOut) - 1 do
         Output := Output + O.StdOut[I] + #13#10;
@@ -237,11 +242,45 @@ begin
     Result := 'O serviço {#ServiceName} demorou demais para parar; tente de novo em instantes.';
 end;
 
+{ The part of a command's output meant for people: from the first "ERRO:" line on
+  (progress lines before it stay in SETUP_LOG). }
+function ErrorPart(const Output: String): String;
+var
+  I: Integer;
+begin
+  I := Pos('ERRO:', Output);
+  if I > 0 then
+    Result := Copy(Output, I, Length(Output) - I + 1)
+  else
+    Result := Output;
+end;
+
 function Failure(const Head, Output: String): String;
 begin
   AppendSetupLog(Head);
-  Result := Head + #13#10#13#10 + Output + #13#10#13#10 + 'Registro completo: ' + SETUP_LOG;
+  Result := Head + #13#10#13#10 + ErrorPart(Output) + #13#10#13#10 + 'Registro completo: ' + SETUP_LOG;
   SuppressibleMsgBox(Result, mbCriticalError, MB_OK, IDOK);
+end;
+
+procedure DropCreatedConfig();
+begin
+  if CreatedConfig then
+  begin
+    DeleteFile(CONFIG_PATH);
+    CreatedConfig := False;
+  end;
+end;
+
+{ Undo a failed or unfinished first install. A netrbin driver that was already
+  there (leftover, or stuck stopping) is not ours to remove: only our service goes. }
+procedure UndoInstall();
+var
+  Ignored: String;
+begin
+  if DriverExisted then
+    RunSvc('uninstall --keep-driver', Ignored)
+  else
+    RunSvc('uninstall', Ignored);
 end;
 
 { A failure after [Files] cannot be rolled back (Inno finalizes the uninstaller
@@ -252,8 +291,7 @@ end;
 function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
   Code: Integer;
-  Output, Ignored: String;
-  CreatedConfig: Boolean;
+  Output: String;
 begin
   Installed := False;
   Result := StopService();
@@ -265,7 +303,6 @@ begin
     Result := Failure('Não foi possível extrair o {#ExeName}; nada foi instalado.', GetExceptionMessage);
     Exit;
   end;
-  CreatedConfig := False;
   if not FileExists(CONFIG_PATH) then
   begin
     Code := RunSvc('init-config --recycle-dir ' + AddQuotes(BinDir()), Output);
@@ -276,6 +313,8 @@ begin
     end;
     CreatedConfig := True;
   end;
+  if Sc('query netrbin') <> ERROR_SERVICE_DOES_NOT_EXIST then
+    DriverExisted := True;
   Code := RunSvc('install --exe ' + AddQuotes(ExpandConstant('{app}\{#ExeName}')), Output);
   if Code <> 0 then
   begin
@@ -284,12 +323,11 @@ begin
         'foram trocados e o serviço anterior continua registrado.', Output)
     else
     begin
-      { First install: undo whatever install did (SNetRBin's driver is kept). }
-      RunSvc('uninstall', Ignored);
-      if CreatedConfig then
-        DeleteFile(CONFIG_PATH);
+      { First install: undo whatever install did. }
+      UndoInstall();
       Result := Failure('A instalação do driver e do serviço falhou; nada foi instalado.', Output);
     end;
+    DropCreatedConfig();
     Exit;
   end;
   Installed := True;
@@ -301,34 +339,36 @@ end;
 procedure CurStepChanged(CurStep: TSetupStep);
 var
   Code: Integer;
-  Output: String;
 begin
   if CurStep <> ssPostInstall then
     Exit;
   FilesDone := True;
   if ServiceExisted and not ServiceWasRunning then
     Exit;
-  Code := RunCapture(ExpandConstant('{sys}\sc.exe'), 'start {#ServiceName}', Output);
+  { sc.exe text is in the OEM code page; only its exit code is shown. }
+  Code := Sc('start {#ServiceName}');
+  AppendSetupLog('sc.exe start {#ServiceName} -> código ' + IntToStr(Code));
   if (Code = 0) or (Code = ERROR_SERVICE_ALREADY_RUNNING) then
     ServiceWasRunning := False { started; DeinitializeSetup has nothing left to do }
   else
-    SuppressibleMsgBox('O rnetrbin foi instalado, mas o serviço não iniciou (código ' + IntToStr(Code) + ').' + #13#10#13#10 +
-      Output + #13#10#13#10 +
+    SuppressibleMsgBox('O rnetrbin foi instalado, mas o Windows não iniciou o serviço {#ServiceName} ' +
+      '(código ' + IntToStr(Code) + ').' + #13#10#13#10 +
       'Veja C:\ProgramData\rnetrbin\rnetrbin-svc.log e use Iniciar em Configurações na janela do rnetrbin.',
       mbError, MB_OK, IDOK);
 end;
 
 { Setup ends (cancelled, failed or done). If the first install registered the service
   but the files never arrived, remove it again (the temp dir still exists here). Otherwise
-  restart a service PrepareToInstall stopped (errors ignored). }
+  restart a service PrepareToInstall stopped (errors ignored). A config this run wrote
+  goes too unless the files were installed. }
 procedure DeinitializeSetup();
-var
-  Output: String;
 begin
   if Installed and (not FilesDone) and (not ServiceExisted) then
-    RunSvc('uninstall', Output)
+    UndoInstall()
   else if ServiceWasRunning then
     Sc('start {#ServiceName}');
+  if not FilesDone then
+    DropCreatedConfig();
 end;
 
 { ---- Uninstall ---- }
