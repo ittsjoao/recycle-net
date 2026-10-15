@@ -84,13 +84,20 @@ pub(super) fn cell<'a>(content: impl Into<Element<'a, Msg>>, w: Length) -> Eleme
     container(content).width(w).clip(true).into()
 }
 
+/// Part of `cur` below `root` ("" when `root` is not a byte prefix of it).
+pub(super) fn crumb_tail<'a>(cur: &'a str, root: &str) -> &'a str {
+    cur.get(root.len()..).unwrap_or("")
+}
+
+pub(super) fn confirm_purge_caption(n: usize) -> String {
+    format!("Confirmar exclusão ({n})")
+}
+
 fn ribbon(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
     let has_sel = !app.selected.is_empty() && !app.busy;
     let on = |m: Msg, ok: bool| ok.then_some(m);
-    ribbon_bar(
-        p,
-        vec![
+    let mut groups = vec![
             group(
                 p,
                 row![
@@ -114,8 +121,23 @@ fn ribbon(app: &App) -> Element<'_, Msg> {
             ),
             group(p, ribbon_button(p, "refresh", "Atualizar", on(Msg::Refresh, !app.busy), false), "Lista"),
             group(p, checkbox(app.all_copies).label("Todas as cópias").on_toggle(Msg::AllCopies), "Mostrar"),
-        ],
-    )
+        ];
+    if app.confirm_purge {
+        let confirm = button(
+            row![icons::icon("delete_forever", 20.0, p.danger), label(confirm_purge_caption(app.selected.len()), 12).color(p.danger)]
+                .spacing(4)
+                .align_y(Alignment::Center),
+        )
+        .padding([4, 8])
+        .style(theme::flat_button(p, false))
+        .on_press_maybe(has_sel.then_some(Msg::ConfirmPurge));
+        groups.push(group(
+            p,
+            column![confirm, label("não dá para desfazer", 11).color(p.muted)].spacing(2).align_x(Alignment::Center),
+            "Excluir de vez?",
+        ));
+    }
+    ribbon_bar(p, groups)
 }
 
 fn tree_nodes<'a>(app: &'a App, path: &str, depth: usize, out: &mut Vec<Element<'a, Msg>>) {
@@ -201,7 +223,7 @@ fn crumbs(app: &App) -> Element<'_, Msg> {
     .spacing(4)
     .align_y(Alignment::Center);
     let mut acc = root.clone();
-    for part in app.cur[root.len().min(app.cur.len())..].split('\\').filter(|s| !s.is_empty()) {
+    for part in crumb_tail(&app.cur, &root).split('\\').filter(|s| !s.is_empty()) {
         acc = format!("{acc}\\{part}");
         r = r.push(sep()).push(link(part.to_string(), acc.clone()));
     }
@@ -310,4 +332,23 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
         .width(Length::Fixed(270.0));
     let right = column![title("Arquivos recuperáveis"), crumbs(app), header(app), rows(app)].spacing(6).padding(8);
     column![ribbon(app), row![container(left).style(theme::surface(p, p.bg)), right].height(Length::Fill)].into()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crumb_tail_never_panics() {
+        assert_eq!(crumb_tail(r"D:\Dados\a\b", r"D:\Dados"), r"\a\b");
+        assert_eq!(crumb_tail(r"D:\Dados", r"D:\Dados"), "");
+        // Root matched case-insensitively with a different byte length: no char boundary.
+        assert_eq!(crumb_tail(r"D:\É\x", r"D:\e"), "");
+        assert_eq!(crumb_tail("D:", r"D:\Dados"), "");
+    }
+
+    #[test]
+    fn confirm_purge_caption_counts_selection() {
+        assert_eq!(confirm_purge_caption(3), "Confirmar exclusão (3)");
+    }
 }

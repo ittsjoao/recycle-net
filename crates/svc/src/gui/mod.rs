@@ -60,7 +60,9 @@ pub enum Msg {
     CloseCopies,
     Restore,
     RestoreTo,
+    /// "Excluir": only arms the confirmation.
     Purge,
+    ConfirmPurge,
     Refresh,
     // Pastas protegidas
     SelectFolder(usize),
@@ -96,6 +98,8 @@ pub struct App {
     folder_sel: Option<usize>,
     rule_edit: Option<folders::RuleEdit>,
     confirm_remove: bool,
+    /// "Excluir" was pressed; "Confirmar exclusão" purges the selection.
+    confirm_purge: bool,
     idx: Option<Arc<Index>>,
     rows: Vec<Version>,
     tree: Tree,
@@ -183,6 +187,7 @@ impl App {
             folder_sel: None,
             rule_edit: None,
             confirm_remove: false,
+            confirm_purge: false,
             idx: None,
             rows: Vec::new(),
             tree: Tree::default(),
@@ -417,6 +422,9 @@ impl App {
         if !matches!(msg, Msg::ConfirmRemove | Msg::Modifiers(_) | Msg::ToastClose(_) | Msg::CloseRequested) {
             self.confirm_remove = false;
         }
+        if !matches!(msg, Msg::ConfirmPurge | Msg::Modifiers(_) | Msg::ToastClose(_) | Msg::CloseRequested) {
+            self.confirm_purge = false;
+        }
         match msg {
             Msg::Tab(t) => self.tab = t,
             Msg::Modifiers(m) => self.mods = m,
@@ -462,7 +470,11 @@ impl App {
                     return self.restore(Some(dir));
                 }
             }
-            Msg::Purge => {
+            Msg::Purge => self.confirm_purge = !self.selected.is_empty(),
+            Msg::ConfirmPurge => {
+                if self.busy || self.selected.is_empty() {
+                    return Task::none();
+                }
                 let Some(idx) = self.idx.clone() else { return Task::none() };
                 let items = self.selected_versions();
                 self.busy = true;
