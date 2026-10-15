@@ -137,6 +137,17 @@ fn run_console(takeover: bool) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// CLI subcommands run by the setup: their stderr ends up in a message box, so
+/// only plain WARN+ lines (no colors, no timestamps) go there.
+fn init_cli_logging() {
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .without_time()
+        .with_max_level(tracing::Level::WARN)
+        .try_init();
+}
+
 /// `init-config --recycle-dir <dir>`: run by the setup before `install`. Writes
 /// a config with zero protected folders unless one already exists (upgrade).
 fn run_init_config(args: &[String]) -> Result<(), String> {
@@ -157,7 +168,7 @@ fn run_init_config(args: &[String]) -> Result<(), String> {
 /// embedded driver unless overridden and points the service at `--exe` (default: this exe). The config must already be valid, so the service never starts
 /// against a config it would reject. Errors come back as pt-BR text for humans.
 fn run_install(args: &[String]) -> Result<(), String> {
-    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+    init_cli_logging();
     let driver = match args.iter().position(|a| a == "--driver") {
         Some(i) => {
             let p = args.get(i + 1).ok_or(r"uso: rnetrbin-svc install [--driver <caminho\netrbin.sys>]")?;
@@ -186,7 +197,7 @@ fn run_install(args: &[String]) -> Result<(), String> {
 }
 
 fn run_uninstall(args: &[String]) -> Result<(), String> {
-    let _ = tracing_subscriber::fmt().with_writer(std::io::stderr).try_init();
+    init_cli_logging();
     let keep = args.iter().any(|a| a == "--keep-driver");
     match install::uninstall(&install::WinHost, keep).map_err(|e| install::describe(&e))? {
         install::Uninstalled::DriverKept => println!("serviço removido; driver netrbin mantido"),
