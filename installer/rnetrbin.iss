@@ -61,10 +61,6 @@ Name: "{autodesktop}\rnetrbin - Lixeira de rede"; Filename: "{app}\{#ExeName}"; 
 ; shellexec: the exe asks for UAC itself when needed.
 Filename: "{app}\{#ExeName}"; Description: "Abrir o rnetrbin"; Flags: postinstall shellexec nowait skipifsilent
 
-[UninstallRun]
-; Removes the service, the driver (unless SNetRBin still uses it) and the audit settings.
-Filename: "{app}\{#ExeName}"; Parameters: "uninstall"; Flags: runhidden waituntilterminated; RunOnceId: "RemoveService"
-
 [Code]
 const
   ERROR_SERVICE_CANNOT_ACCEPT_CTRL = 1061;
@@ -115,6 +111,33 @@ procedure CurStepChanged(CurStep: TSetupStep);
 begin
   if (CurStep = ssPostInstall) and ServiceWasRunning then
     Sc('start {#ServiceName}');
+end;
+
+{ Cancelled or failed after PrepareToInstall stopped the service: start it again.
+  After a normal install it is already running and this is a no-op (errors ignored). }
+procedure DeinitializeSetup();
+begin
+  if ServiceWasRunning then
+    Sc('start {#ServiceName}');
+end;
+
+{ Remove the service, the driver (unless SNetRBin still uses it) and the audit settings
+  before any file is deleted. [UninstallRun] would ignore a failure and delete the exe,
+  leaving an automatic service pointing at nothing; here a failure aborts and keeps it all. }
+function InitializeUninstall(): Boolean;
+var
+  Code: Integer;
+begin
+  Result := True;
+  { An exe that cannot even be launched (already gone) has nothing left to remove. }
+  if not Exec(ExpandConstant('{app}\{#ExeName}'), 'uninstall', '', SW_HIDE, ewWaitUntilTerminated, Code) then
+    Exit;
+  if Code <> 0 then
+  begin
+    SuppressibleMsgBox('Não foi possível remover o serviço do rnetrbin (código ' + IntToStr(Code) + '). ' +
+      'Nada foi apagado. Pare o serviço e tente de novo.', mbError, MB_OK, IDOK);
+    Result := False;
+  end;
 end;
 
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);

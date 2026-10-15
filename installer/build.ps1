@@ -22,8 +22,9 @@ if (-not $iscc) {
 }
 
 $manifest = Get-Content (Join-Path $root 'crates\svc\Cargo.toml')
-$version = ($manifest | Select-String -Pattern '^version = "([^"]+)"' | Select-Object -First 1).Matches[0].Groups[1].Value
-if (-not $version) { throw 'versao nao encontrada em crates\svc\Cargo.toml' }
+$match = $manifest | Select-String -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+if (-not $match) { throw 'versao nao encontrada em crates\svc\Cargo.toml' }
+$version = $match.Matches[0].Groups[1].Value
 
 Push-Location $root
 try {
