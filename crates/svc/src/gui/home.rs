@@ -95,7 +95,8 @@ pub(super) fn confirm_purge_caption(n: usize) -> String {
 
 fn ribbon(app: &App) -> Element<'_, Msg> {
     let p = app.pal();
-    let has_sel = !app.selected.is_empty() && !app.busy;
+    let has_sel = app.has_selection() && !app.busy;
+    let one_file = !app.selected.is_empty() && !app.busy;
     let on = |m: Msg, ok: bool| ok.then_some(m);
     let mut groups = vec![
             group(
@@ -114,7 +115,7 @@ fn ribbon(app: &App) -> Element<'_, Msg> {
                     ribbon_button(p, "restore", "Restaurar", on(Msg::Restore, has_sel), false),
                     ribbon_button(p, "drive_file_move", "Restaurar em...", on(Msg::RestoreTo, has_sel), false),
                     ribbon_button(p, "delete_forever", "Excluir", on(Msg::Purge, has_sel), true),
-                    ribbon_button(p, "history", "Ver cópias", on(Msg::ShowCopies, has_sel), false),
+                    ribbon_button(p, "history", "Ver cópias", on(Msg::ShowCopies, one_file), false),
                 ]
                 .spacing(2),
                 "Ações",
@@ -122,9 +123,9 @@ fn ribbon(app: &App) -> Element<'_, Msg> {
             group(p, ribbon_button(p, "refresh", "Atualizar", on(Msg::Refresh, !app.busy), false), "Lista"),
             group(p, checkbox(app.all_copies).label("Todas as cópias").on_toggle(Msg::AllCopies), "Mostrar"),
         ];
-    if app.confirm_purge {
+    if let Some(n) = app.confirm_purge {
         let confirm = button(
-            row![icons::icon("delete_forever", 20.0, p.danger), label(confirm_purge_caption(app.selected.len()), 12).color(p.danger)]
+            row![icons::icon("delete_forever", 20.0, p.danger), label(confirm_purge_caption(n), 12).color(p.danger)]
                 .spacing(4)
                 .align_y(Alignment::Center),
         )
@@ -278,8 +279,8 @@ fn rows(app: &App) -> Element<'_, Msg> {
                 dim(if d.info.count > 0 { listing::fmt_time(d.info.last) } else { String::new() }, W_TIME),
             ]
             .align_y(Alignment::Center),
-            false,
-            Msg::Go(d.path.clone()),
+            app.selected_dirs.contains(&d.path),
+            Msg::ClickDir(d.path.clone()),
         ));
     }
     for f in &app.listing.files {

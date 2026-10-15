@@ -95,6 +95,39 @@ pub fn build(tree: &Tree, rows: &[Version], v: &View) -> Listing {
     Listing { dirs, files, total_files }
 }
 
+/// Backups below folder `dir` at any depth; `newest_only` keeps the newest
+/// backup of each original path (what restoring a folder brings back).
+pub fn under(rows: &[Version], dir: &str, newest_only: bool) -> Vec<Version> {
+    let prefix = format!("{}\\", key(dir));
+    let mut best: HashMap<String, Version> = HashMap::new();
+    let mut all = Vec::new();
+    for r in rows.iter().filter(|r| key(&r.original_path).starts_with(&prefix)) {
+        if !newest_only {
+            all.push(r.clone());
+            continue;
+        }
+        let k = key(&r.original_path);
+        if best.get(&k).is_none_or(|b| (b.deleted_utc, b.id) < (r.deleted_utc, r.id)) {
+            best.insert(k, r.clone());
+        }
+    }
+    if newest_only { best.into_values().collect() } else { all }
+}
+
+/// "Restaurar em" target of `original`: picked through folder `via`, it keeps
+/// its path below that folder (`<dest>\<folder name>\sub\a.txt`; a drive root
+/// `F:\` is named `F`); picked alone, it lands directly in `dest`.
+pub fn restore_target(dest: &std::path::Path, via: Option<&str>, original: &str) -> std::path::PathBuf {
+    match via {
+        Some(dir) => {
+            let dir = dir.trim_end_matches('\\');
+            let name = split_path(dir).0.trim_end_matches(':');
+            dest.join(name).join(original.get(dir.len() + 1..).unwrap_or(original))
+        }
+        None => dest.join(split_path(original).0),
+    }
+}
+
 fn sort(files: &mut [Version], (col, asc): (SortCol, bool)) {
     files.sort_by(|a, b| {
         let o = match col {
@@ -251,5 +284,23 @@ mod tests {
         assert_eq!(fmt_size(2048), "2 KB");
         assert_eq!(fmt_size(5 * 1024 * 1024), "5.0 MB");
         assert_eq!(split_masks(" *.docx ;; Relatório *.xlsx "), ["*.docx", "Relatório *.xlsx"]);
+    }
+
+    #[test]
+    fn under_takes_every_depth_and_optionally_the_newest_copy() {
+        let mut r = rows();
+        r.push(v(5, r"D:\DadosOld\x.txt", 1, None, 1));
+        let ids = |mut v: Vec<Version>| { v.sort_by_key(|x| x.id); v.into_iter().map(|x| x.id).collect::<Vec<_>>() };
+        assert_eq!(ids(under(&r, r"d:\dados", false)), [1, 2, 3, 4]);
+        assert_eq!(ids(under(&r, r"D:\Dados\", true)), [2, 3, 4]); // a.txt: newest only
+        assert_eq!(ids(under(&r, r"D:\Dados\Sub", false)), [3, 4]);
+    }
+
+    #[test]
+    fn restore_target_keeps_the_structure_below_a_picked_folder() {
+        let dest = std::path::Path::new(r"X:\Volta");
+        assert_eq!(restore_target(dest, None, r"D:\Dados\Sub\b.txt"), dest.join("b.txt"));
+        assert_eq!(restore_target(dest, Some(r"D:\Dados\Sub"), r"D:\Dados\Sub\Deep\c.txt"), dest.join(r"Sub\Deep\c.txt"));
+        assert_eq!(restore_target(dest, Some(r"F:\"), r"F:\a\b.txt"), dest.join(r"F\a\b.txt"));
     }
 }
