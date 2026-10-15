@@ -39,6 +39,7 @@ I7. `uninstall` with SNetRBin installed (or `--keep-driver`): only our service i
     SNetRBin is back to its original start type and running.
 I8. Coexisting `install`: SNetRBin's `netrbin.sys` is not rewritten ("usando o driver já
     instalado"); a `netrbin` left at Start=4 is set back to 0 ("reativado").
+    Upgrading while `netrbin` is loaded keeps the installed driver (file not rewritten).
 
 ## Cases
 1. Large file (multiple 64KB chunks, > 128KB) deleted over SMB: finalized backup plus SQLite row appear; restore by id matches bytes.
