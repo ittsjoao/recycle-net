@@ -24,7 +24,7 @@ conversa com o minifilter de terceiro `netrbin.sys` (produto licenciado) pela po
 - Registro do driver (Altitude 370150, Group Filter, Start 0) vem do instalador v6.1.1.3; confira com `fltmc`.
 - Se `SNetRBin` (original) existir, o servico assume o lugar dele e devolve no STOP; `uninstall` mantem o driver.
 - Quem apagou vem da auditoria do Windows (SACL global so DELETE para Usuarios do Dominio ou
-  `S-1-5-32-545` fora de dominio + evento 4663), ligada pelo servico ao iniciar e desfeita no
+  `S-1-5-32-545` fora de dominio + eventos 4663 e 4659 (Delete On Close, apagar pelo SMB)), ligada pelo servico ao iniciar e desfeita no
   `uninstall` conforme `C:\ProgramData\rnetrbin\audit-state.toml` (entrada ja existente,
   `sacl_existed`, fica intocada). Precisa de admin; sem auditoria o usuario fica "desconhecido".
 - Pastas protegidas nao aninham (o driver junta as mascaras numa lista so); zero pastas e valido
