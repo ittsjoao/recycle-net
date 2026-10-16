@@ -1,0 +1,49 @@
+# Pushing a tag vX.Y.Z (matching crates/svc/Cargo.toml) publishes a GitHub Release
+# with the installer and the bare exe.
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Tag matches crate version
+        shell: pwsh
+        run: |
+          $m = Select-String -Path crates/svc/Cargo.toml -Pattern '^version = "([^"]+)"' | Select-Object -First 1
+          $version = $m.Matches[0].Groups[1].Value
+          if ("v$version" -ne $env:GITHUB_REF_NAME) {
+            throw "tag $env:GITHUB_REF_NAME nao bate com a versao $version de crates/svc/Cargo.toml"
+          }
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Install Inno Setup
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe")) {
+            choco install innosetup -y --no-progress
+          }
+
+      - name: Build exe and installer
+        shell: pwsh
+        run: ./installer/build.ps1
+
+      - name: Publish release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create $env:GITHUB_REF_NAME `
+            "target/installer/rnetrbin-setup-$env:VERSION.exe" `
+            target/release/rnetrbin-svc.exe `
+            --title "rnetrbin $env:VERSION" --generate-notes

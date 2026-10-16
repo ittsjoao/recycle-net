@@ -15,7 +15,7 @@ conversa com o minifilter `netrbin.sys` pela porta `\CaptureFileMonitorPort`.
   [--driver <sys>] [--exe <exe>]`, `sc.exe start rnetrbin-svc`; remover com `uninstall [--keep-driver]`
 - janela: exe sem argumentos (pede UAC); abas Inicio, Pastas protegidas (Incluir/Excluir) e Configuracoes
   (servico, iniciar com o Windows, tema). SCM: `--service`; console: `--console [--takeover]` (1o argumento)
-- instalador (uso interno, nao publicar): `installer/build.ps1` -> `target\installer\rnetrbin-setup-<versao>.exe`
+- instalador: `installer/build.ps1` -> `target\installer\rnetrbin-setup-<versao>.exe`
 
 ## Convencoes que nao se deduzem do codigo
 

@@ -1,5 +1,5 @@
 # Builds target\release\rnetrbin-svc.exe and compiles the Inno Setup installer into
-# target\installer\rnetrbin-setup-<version>.exe. Internal use only (embeds netrbin.sys).
+# target\installer\rnetrbin-setup-<version>.exe.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
 $exe = Join-Path $root 'target\release\rnetrbin-svc.exe'
