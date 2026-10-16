@@ -1,5 +1,5 @@
 //! Who deleted a file: Windows object-access auditing (global SACL, DELETE only)
-//! plus a subscription to Security event 4663.
+//! plus a subscription to Security events 4663 and 4659.
 pub mod event;
 pub mod setup;
 pub mod subscribe;

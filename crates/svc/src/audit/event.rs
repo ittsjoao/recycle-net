@@ -36,9 +36,13 @@ fn time_created(xml: &str) -> Option<String> {
     Some(rest[..rest.find(q)?].to_string())
 }
 
-/// A file deletion from an event 4663 rendered as XML; None for any other event.
-pub fn parse_4663(xml: &str) -> Option<DeleteEvent> {
-    if !xml.contains("<EventID>4663</EventID>") || data(xml, "ObjectType")? != "File" {
+/// A file deletion from an event rendered as XML; None for any other event.
+/// 4663: DELETE used on an open handle (e.g. DeleteFile on the server).
+/// 4659: handle requested with intent to delete (FILE_DELETE_ON_CLOSE), which
+/// is how Explorer on a workstation deletes over SMB; it logs no 4663.
+pub fn parse_delete(xml: &str) -> Option<DeleteEvent> {
+    let id = ["<EventID>4663</EventID>", "<EventID>4659</EventID>"];
+    if !id.iter().any(|i| xml.contains(i)) || data(xml, "ObjectType")? != "File" {
         return None;
     }
     let mask = data(xml, "AccessMask")?;
@@ -79,7 +83,7 @@ mod tests {
 
     #[test]
     fn parses_user_path_and_time_and_unescapes() {
-        let e = parse_4663(&sample("File", "0x10000", "D:\\Dados\\R&amp;D\\a.txt")).unwrap();
+        let e = parse_delete(&sample("File", "0x10000", "D:\\Dados\\R&amp;D\\a.txt")).unwrap();
         assert_eq!(e.path, "D:\\Dados\\R&D\\a.txt");
         assert_eq!(e.user, "AUSTER2\\joao.silva");
         assert_eq!(e.sid, "S-1-5-21-1-2-3-1104");
@@ -89,23 +93,36 @@ mod tests {
     #[test]
     fn accepts_double_quotes_and_combined_masks() {
         let xml = sample("File", "0x10080", "D:\\a.txt").replace('\'', "\"");
-        assert!(parse_4663(&xml).is_some());
+        assert!(parse_delete(&xml).is_some());
     }
 
     #[test]
     fn rejects_other_objects_masks_and_events() {
-        assert!(parse_4663(&sample("Key", "0x10000", "\\REGISTRY\\x")).is_none());
-        assert!(parse_4663(&sample("File", "0x2", "D:\\a.txt")).is_none());
-        assert!(parse_4663(&sample("File", "0x10000", "D:\\a.txt").replace("4663", "4660")).is_none());
-        assert!(parse_4663("<Event/>").is_none());
+        assert!(parse_delete(&sample("Key", "0x10000", "\\REGISTRY\\x")).is_none());
+        assert!(parse_delete(&sample("File", "0x2", "D:\\a.txt")).is_none());
+        assert!(parse_delete(&sample("File", "0x10000", "D:\\a.txt").replace("4663", "4660")).is_none());
+        assert!(parse_delete("<Event/>").is_none());
+    }
+
+    #[test]
+    fn accepts_4659_the_delete_on_close_request_smb_clients_send() {
+        // Seen on Server 2019 for an Explorer delete from a workstation:
+        // 4659 AUSTER2\joao.silva 0x10080 E:\Dados\TI\teste\Novo Documento de Texto.txt
+        let xml = sample("File", "0x10080", "E:\\Dados\\TI\\teste\\Novo Documento de Texto.txt")
+            .replace("<EventID>4663</EventID>", "<EventID>4659</EventID>");
+        let e = parse_delete(&xml).unwrap();
+        assert_eq!(e.path, "E:\\Dados\\TI\\teste\\Novo Documento de Texto.txt");
+        assert_eq!(e.user, "AUSTER2\\joao.silva");
+        let no_delete = sample("File", "0x80", "D:\\a.txt").replace("<EventID>4663</EventID>", "<EventID>4659</EventID>");
+        assert!(parse_delete(&no_delete).is_none());
     }
 
     #[test]
     fn rejects_malformed_systemtime_with_non_ascii_quote() {
         // Regression test: non-ASCII char after SystemTime= should not panic
-        // Instead, parse_4663 should return None
+        // Instead, parse_delete should return None
         let xml = sample("File", "0x10000", "D:\\a.txt").replace("SystemTime='", "SystemTime=é");
-        assert!(parse_4663(&xml).is_none());
+        assert!(parse_delete(&xml).is_none());
     }
 
     #[test]
@@ -115,6 +132,6 @@ mod tests {
         // Remove the SubjectUserName Data element
         let to_remove = "<Data Name='SubjectUserName'>joao.silva</Data>";
         xml = xml.replace(to_remove, "");
-        assert!(parse_4663(&xml).is_none());
+        assert!(parse_delete(&xml).is_none());
     }
 }

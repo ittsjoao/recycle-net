@@ -54,6 +54,8 @@ pub enum Msg {
     Go(String),
     ToggleNode(String),
     Click(i64),
+    /// Folder row: one click selects it, a second click on it opens it.
+    ClickDir(String),
     Sort(SortCol),
     AllCopies(bool),
     ShowCopies,
@@ -97,8 +99,8 @@ pub struct App {
     folder_sel: Option<usize>,
     rule_edit: Option<folders::RuleEdit>,
     confirm_remove: bool,
-    /// "Excluir" was pressed; "Confirmar exclusão" purges the selection.
-    confirm_purge: bool,
+    /// "Excluir" was pressed: how many backups "Confirmar exclusão" purges.
+    confirm_purge: Option<usize>,
     idx: Option<Arc<Index>>,
     rows: Vec<Version>,
     tree: Tree,
@@ -110,6 +112,10 @@ pub struct App {
     copies_of: Option<String>,
     sort: (SortCol, bool),
     selected: BTreeSet<i64>,
+    /// Folders picked in the list: they stand for every backup below them.
+    selected_dirs: BTreeSet<String>,
+    /// Last folder row clicked and when: a second click on it soon after opens it.
+    last_dir_click: Option<(String, std::time::Instant)>,
     anchor: Option<i64>,
     mods: keyboard::Modifiers,
     svc: SvcState,
@@ -172,7 +178,10 @@ fn summary(done: &str, n: usize, errs: Vec<String>) -> Result<String, String> {
     match errs.len() {
         0 => Ok(format!("{n} {done}.")),
         1 if n == 1 => Err(errs.join("")),
-        k => Err(format!("{k} de {n} não deram certo. {}", errs.join(" "))),
+        k => {
+            let more = if k > 3 { format!(" (e mais {})", k - 3) } else { String::new() };
+            Err(format!("{k} de {n} não deram certo. {}{more}", errs[..k.min(3)].join(" ")))
+        }
     }
 }
 
@@ -198,7 +207,7 @@ impl App {
             folder_sel: None,
             rule_edit: None,
             confirm_remove: false,
-            confirm_purge: false,
+            confirm_purge: None,
             idx: None,
             rows: Vec::new(),
             tree: Tree::default(),
@@ -210,6 +219,8 @@ impl App {
             copies_of: None,
             sort: (SortCol::Deleted, false),
             selected: BTreeSet::new(),
+            selected_dirs: BTreeSet::new(),
+            last_dir_click: None,
             anchor: None,
             mods: keyboard::Modifiers::default(),
             svc: SvcState::NotInstalled,
@@ -319,6 +330,8 @@ impl App {
         );
         let visible: BTreeSet<i64> = self.listing.files.iter().map(|f| f.id).collect();
         self.selected.retain(|id| visible.contains(id));
+        let dirs: BTreeSet<&str> = self.listing.dirs.iter().map(|d| d.path.as_str()).collect();
+        self.selected_dirs.retain(|d| dirs.contains(d.as_str()));
     }
 
     /// Navigate to a folder and open its branch in the tree.
@@ -336,11 +349,34 @@ impl App {
         self.query.clear();
         self.copies_of = None;
         self.selected.clear();
+        self.selected_dirs.clear();
         self.anchor = None;
         self.relist();
     }
 
+    fn click_dir(&mut self, path: String) {
+        let now = std::time::Instant::now();
+        let again = self.last_dir_click.as_ref()
+            .is_some_and(|(p, t)| *p == path && now.duration_since(*t) < Duration::from_millis(500));
+        if again {
+            self.last_dir_click = None;
+            return self.go(path);
+        }
+        if self.mods.control() {
+            if !self.selected_dirs.remove(&path) {
+                self.selected_dirs.insert(path.clone());
+            }
+        } else {
+            self.selected.clear();
+            self.selected_dirs = BTreeSet::from([path.clone()]);
+        }
+        self.last_dir_click = Some((path, now));
+    }
+
     fn click(&mut self, id: i64) {
+        if !self.mods.control() {
+            self.selected_dirs.clear();
+        }
         if self.mods.control() {
             if !self.selected.remove(&id) {
                 self.selected.insert(id);
@@ -362,6 +398,21 @@ impl App {
 
     fn selected_versions(&self) -> Vec<Version> {
         self.listing.files.iter().filter(|f| self.selected.contains(&f.id)).cloned().collect()
+    }
+
+    /// Backups the selection stands for, each with the folder it was picked
+    /// through (None = picked as a file). `newest_only` applies to folders.
+    fn chosen(&self, newest_only: bool) -> Vec<(Version, Option<String>)> {
+        let mut seen = BTreeSet::new();
+        let files = self.selected_versions().into_iter().map(|v| (v, None));
+        let dirs = self.selected_dirs.iter().flat_map(|d| {
+            listing::under(&self.rows, d, newest_only).into_iter().map(move |v| (v, Some(d.clone())))
+        });
+        files.chain(dirs).filter(|(v, _)| seen.insert(v.id)).collect()
+    }
+
+    fn has_selection(&self) -> bool {
+        !self.selected.is_empty() || !self.selected_dirs.is_empty()
     }
 
     /// Validate and write the config; restart the service if it is running.
@@ -398,12 +449,12 @@ impl App {
 
     fn restore(&mut self, dir: Option<PathBuf>) -> Task<Msg> {
         let Some(idx) = self.idx.clone() else { return Task::none() };
-        let items = self.selected_versions();
+        let items = self.chosen(true);
         self.busy = true;
         work(move || {
             let mut errs = Vec::new();
-            for v in &items {
-                let dest = dir.as_ref().map(|d| d.join(listing::split_path(&v.original_path).0));
+            for (v, via) in &items {
+                let dest = dir.as_ref().map(|d| listing::restore_target(d, via.as_deref(), &v.original_path));
                 let r = match &dest {
                     // restore() with an override copies over the target; never clobber here.
                     Some(d) if d.exists() => {
@@ -435,7 +486,7 @@ impl App {
             self.confirm_remove = false;
         }
         if !matches!(msg, Msg::ConfirmPurge | Msg::Modifiers(_) | Msg::ToastClose(_) | Msg::CloseRequested) {
-            self.confirm_purge = false;
+            self.confirm_purge = None;
         }
         match msg {
             Msg::Tab(t) => self.tab = t,
@@ -453,6 +504,7 @@ impl App {
                 }
             }
             Msg::Click(id) => self.click(id),
+            Msg::ClickDir(p) => self.click_dir(p),
             Msg::Sort(col) => {
                 self.sort = if self.sort.0 == col {
                     (col, !self.sort.1)
@@ -482,18 +534,18 @@ impl App {
                     return self.restore(Some(dir));
                 }
             }
-            Msg::Purge => self.confirm_purge = !self.selected.is_empty(),
+            Msg::Purge => self.confirm_purge = self.has_selection().then(|| self.chosen(false).len()),
             Msg::ConfirmPurge => {
-                if self.busy || self.selected.is_empty() {
+                if self.busy || !self.has_selection() {
                     return Task::none();
                 }
                 let Some(idx) = self.idx.clone() else { return Task::none() };
-                let items = self.selected_versions();
+                let items = self.chosen(false);
                 self.busy = true;
                 return work(move || {
                     let errs: Vec<String> = items
                         .iter()
-                        .filter_map(|v| {
+                        .filter_map(|(v, _)| {
                             crate::retention::purge(&idx, v.id).err().map(|e| messages::purge(&e, &v.original_path))
                         })
                         .collect();
@@ -724,7 +776,7 @@ impl App {
                 state("Driver", self.driver == SvcState::Running, if self.driver == SvcState::Running { "carregado" } else { "não carregado" }),
                 state("Auditoria", self.audit.policy_success, if self.audit.policy_success { "ativa" } else { "desligada" }),
                 text(format!("Lixeira: {} de {limit} GB", listing::fmt_size(used))).size(12),
-                text(format!("{} selecionado(s)", self.selected.len())).size(12),
+                text(format!("{} selecionado(s)", self.selected.len() + self.selected_dirs.len())).size(12),
                 Space::new().width(Length::Fill),
                 text(if self.busy { "Trabalhando..." } else { "" }).size(12),
             ]
@@ -741,6 +793,14 @@ impl App {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn summary_shows_at_most_three_errors() {
+        assert_eq!(summary("ok", 2, vec![]), Ok("2 ok.".into()));
+        assert_eq!(summary("ok", 1, vec!["e".into()]), Err("e".into()));
+        let errs = (1..=5).map(|i| format!("e{i}.")).collect();
+        assert_eq!(summary("ok", 9, errs), Err("5 de 9 não deram certo. e1. e2. e3. (e mais 2)".into()));
+    }
 
     #[test]
     fn first_use_opens_protected_folders_then_settings_when_not_installed() {

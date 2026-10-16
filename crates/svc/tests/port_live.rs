@@ -8,5 +8,5 @@ fn connect_and_configure_against_live_driver() {
     let c = PortClient::connect().expect("connect");
     c.configure(&["*.*".into()], &[], r"D:\RecycleBinNet").expect("configure");
     // Manual assertion: delete a file on a monitored volume and confirm a
-    // .nrbnew + flag file appears under D:\RecycleBinNet.
+    // copy plus its empty `<name>.nrbnew` flag appears under D:\RecycleBinNet\D\.
 }

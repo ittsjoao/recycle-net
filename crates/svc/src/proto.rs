@@ -15,14 +15,17 @@ pub fn encode_mask(mask: &str) -> Vec<u8> {
 }
 
 pub fn encode_setup(enabled: bool, log_dir: &str) -> Vec<u8> {
-    // UTF-16 of the path WITHOUT prefix and WITHOUT nul; cbLogDir = byte length
+    // UTF-16 of the path WITHOUT prefix; cbLogDir = byte length without the nul.
+    // The nul is still required: the driver appends the path with
+    // RtlAppendUnicodeToString, which reads up to the nul and ignores cbLogDir.
     let units: Vec<u16> = log_dir.encode_utf16().collect();
     let cb = (units.len() * 2) as u16;
-    let mut out = Vec::with_capacity(4 + cb as usize);
+    let mut out = Vec::with_capacity(4 + cb as usize + 2);
     out.push(if enabled { 1 } else { 0 }); // bEnabled
     out.push(0);                            // pad
     out.extend_from_slice(&cb.to_le_bytes());
     for u in units { out.extend_from_slice(&u.to_le_bytes()); }
+    out.extend_from_slice(&[0, 0]);
     out
 }
 
@@ -52,7 +55,8 @@ mod tests {
         let cb = u16::from_le_bytes([b[2], b[3]]);
         assert_eq!(cb, 12);
         assert_eq!(&b[4..6], &[0x44, 0x00]);
-        assert_eq!(b.len(), 4 + 12);
+        assert_eq!(b.len(), 4 + 12 + 2);
+        assert_eq!(&b[b.len() - 2..], &[0, 0]);
     }
 
     #[test]

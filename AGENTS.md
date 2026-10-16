@@ -24,7 +24,7 @@ conversa com o minifilter `netrbin.sys` pela porta `\CaptureFileMonitorPort`.
 - Registro do driver (Altitude 370150, Group Filter, Start 0) vem do instalador v6.1.1.3; confira com `fltmc`.
 - Se `SNetRBin` (original) existir, o servico assume o lugar dele e devolve no STOP; `uninstall` mantem o driver.
 - Quem apagou vem da auditoria do Windows (SACL global so DELETE para Usuarios do Dominio ou
-  `S-1-5-32-545` fora de dominio + evento 4663), ligada pelo servico ao iniciar e desfeita no
+  `S-1-5-32-545` fora de dominio + eventos 4663 e 4659 (Delete On Close, apagar pelo SMB)), ligada pelo servico ao iniciar e desfeita no
   `uninstall` conforme `C:\ProgramData\rnetrbin\audit-state.toml` (entrada ja existente,
   `sacl_existed`, fica intocada). Precisa de admin; sem auditoria o usuario fica "desconhecido".
 - Pastas protegidas nao aninham (o driver junta as mascaras numa lista so); zero pastas e valido
@@ -33,8 +33,8 @@ conversa com o minifilter `netrbin.sys` pela porta `\CaptureFileMonitorPort`.
 ## Armadilhas
 
 - Porta do driver aceita UM cliente: com SNetRBin rodando, nada conecta. Desinstalar o original apaga o driver.
-- Mascaras do driver casam com o caminho DOS completo em MAIUSCULAS: use
-  `config::driver_masks`, nunca a mascara crua. Layout de paths da copia nao confirmado em runtime.
+- Driver casa mascaras com `\E:\dir\arq` (barra na frente, MAIUSCULAS): use `config::driver_masks`.
+  Nao ve apagar local no Server 2019+ (classe 64); contrato da copia em `docs/notes/port-protocol-confirmation.md`.
 
 ## Tarefa, branch e commit
 

@@ -1,4 +1,4 @@
-//! EvtSubscribe on the Security channel: keep 4663 deletes under protected folders.
+//! EvtSubscribe on the Security channel: keep 4663/4659 deletes under protected folders.
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -13,7 +13,7 @@ use windows::Win32::System::EventLog::{
     EVT_HANDLE, EVT_RENDER_FLAGS, EVT_SUBSCRIBE_NOTIFY_ACTION,
 };
 
-const QUERY: &str = "*[System[EventID=4663]]";
+const QUERY: &str = "*[System[(EventID=4663 or EventID=4659)]]";
 const BOOKMARK_KEY: &str = "audit.bookmark";
 const SAVE_BOOKMARK_EVERY: Duration = Duration::from_secs(30);
 
@@ -78,7 +78,7 @@ fn save_bookmark(idx: &Index, sink: &Sink) {
 }
 
 fn handle_event(idx: &Index, roots: &[String], xml: &str) {
-    if let Some(e) = crate::audit::event::parse_4663(xml) {
+    if let Some(e) = crate::audit::event::parse_delete(xml) {
         if under_any(roots, &e.path) {
             if let Err(err) = idx.add_delete_event(&e) {
                 tracing::warn!("audit: cannot store event: {err}");
@@ -128,7 +128,7 @@ pub fn run(idx: Arc<Index>, roots: Vec<String>, stop: Arc<AtomicBool>) -> Result
         }
         format!("EvtSubscribe: {e}")
     })?;
-    tracing::info!("audit: subscribed to Security 4663");
+    tracing::info!("audit: subscribed to Security 4663/4659");
 
     let mut failure = None;
     let mut last_save = Instant::now();
