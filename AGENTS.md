@@ -1,9 +1,9 @@
 # rnetrbin
 
-## O que e
+## O que é
 
 Lixeira de rede para shares SMB em Windows: servico Rust user-mode (`rnetrbin-svc`) que instala e
-conversa com o minifilter de terceiro `netrbin.sys` (produto licenciado) pela porta `\CaptureFileMonitorPort`.
+conversa com o minifilter `netrbin.sys` pela porta `\CaptureFileMonitorPort`.
 
 ## Como rodar
 
@@ -32,10 +32,7 @@ conversa com o minifilter de terceiro `netrbin.sys` (produto licenciado) pela po
 
 ## Armadilhas
 
-- `netrbin.sys` nunca vai para o git (`*.sys` no .gitignore): binario de terceiro. O build falha
-  sem ele (build.rs); o exe gerado nao pode ser publicado.
 - Porta do driver aceita UM cliente: com SNetRBin rodando, nada conecta. Desinstalar o original apaga o driver.
-- Assinatura do driver cross-signed 2015 (expirou 2016): pode cair com HVCI (Win 11 / Server 2022).
 - Mascaras do driver casam com o caminho DOS completo em MAIUSCULAS: use
   `config::driver_masks`, nunca a mascara crua. Layout de paths da copia nao confirmado em runtime.
 
