@@ -1,16 +1,16 @@
 //! Embeds `netrbin.sys` into the binary so `install` needs no external file.
-//! Source: `$RNETRBIN_DRIVER`, else `<workspace>/driver/netrbin.sys`. The build
+//! Source: `$RECYCLE_NET_DRIVER`, else `<workspace>/driver/netrbin.sys`. The build
 //! fails without it: an exe that cannot install the driver is not shippable.
-//! Also embeds the app icon: `icons/rnetrbin.ico` as the exe resource (Explorer,
-//! shortcuts) and `icons/rnetrbin.png` as raw RGBA for the window (taskbar).
+//! Also embeds the app icon: `icons/recycle-net.ico` as the exe resource (Explorer,
+//! shortcuts) and `icons/recycle-net.png` as raw RGBA for the window (taskbar).
 use std::path::PathBuf;
 
 const IMAGE_FILE_MACHINE_AMD64: u16 = 0x8664;
 
 fn main() {
     embed_icon();
-    println!("cargo:rerun-if-env-changed=RNETRBIN_DRIVER");
-    let src = match std::env::var_os("RNETRBIN_DRIVER") {
+    println!("cargo:rerun-if-env-changed=RECYCLE_NET_DRIVER");
+    let src = match std::env::var_os("RECYCLE_NET_DRIVER") {
         Some(p) => PathBuf::from(p),
         None => PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../../driver/netrbin.sys"),
     };
@@ -19,7 +19,7 @@ fn main() {
         panic!(
             "netrbin.sys not found at {} ({e}). Copy it from a licensed install \
              (C:\\Windows\\System32\\drivers\\netrbin.sys) to driver/netrbin.sys \
-             or set RNETRBIN_DRIVER.",
+             or set RECYCLE_NET_DRIVER.",
             src.display()
         )
     });
@@ -31,13 +31,13 @@ fn main() {
 }
 
 fn embed_icon() {
-    println!("cargo:rerun-if-changed=rnetrbin.rc");
-    println!("cargo:rerun-if-changed=../../icons/rnetrbin.ico");
-    embed_resource::compile("rnetrbin.rc", embed_resource::NONE)
+    println!("cargo:rerun-if-changed=recycle-net.rc");
+    println!("cargo:rerun-if-changed=../../icons/recycle-net.ico");
+    embed_resource::compile("recycle-net.rc", embed_resource::NONE)
         .manifest_optional()
-        .expect("compile rnetrbin.rc");
+        .expect("compile recycle-net.rc");
 
-    let png = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../../icons/rnetrbin.png");
+    let png = PathBuf::from(std::env::var_os("CARGO_MANIFEST_DIR").unwrap()).join("../../icons/recycle-net.png");
     println!("cargo:rerun-if-changed={}", png.display());
     let file = std::fs::File::open(&png).unwrap_or_else(|e| panic!("{}: {e}", png.display()));
     let mut decoder = png::Decoder::new(file);

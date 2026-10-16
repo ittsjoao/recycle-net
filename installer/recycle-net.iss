@@ -1,4 +1,4 @@
-﻿; rnetrbin installer (Inno Setup 6). Build with installer\build.ps1.
+﻿; recycle-net installer (Inno Setup 6). Build with installer\build.ps1.
 ; Setup installs everything: on a first install it asks for the recycle-bin folder and
 ; writes a config with zero protected folders (`init-config`), then registers and loads
 ; the driver and registers the service (`install`, see PrepareToInstall) and starts it.
@@ -20,25 +20,27 @@
   #endif
 #endif
 
-#define ServiceName "rnetrbin-svc"
-#define ExeName "rnetrbin-svc.exe"
+#define ServiceName "recycle-net"
+#define ExeName "recycle-net.exe"
 
 [Setup]
 AppId={{CF494231-F3A9-44C0-8FB2-4B18A5A12B7D}
-AppName=rnetrbin
+AppName=recycle-net
 AppVersion={#AppVersion}
-AppVerName=rnetrbin {#AppVersion}
-AppPublisher=rnetrbin
-DefaultDirName={autopf}\rnetrbin
+AppVerName=recycle-net {#AppVersion}
+AppPublisher=recycle-net
+DefaultDirName={autopf}\recycle-net
+; v0.1.0 lived in {autopf}\rnetrbin under the same AppId: do not reuse that dir.
+UsePreviousAppDir=no
 DisableProgramGroupPage=yes
 PrivilegesRequired=admin
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\target\installer
-OutputBaseFilename=rnetrbin-setup-{#AppVersion}
+OutputBaseFilename=recycle-net-setup-{#AppVersion}
 UninstallDisplayIcon={app}\{#ExeName}
-SetupIconFile=..\icons\rnetrbin.ico
-UninstallDisplayName=rnetrbin - Lixeira de rede
+SetupIconFile=..\icons\recycle-net.ico
+UninstallDisplayName=recycle-net
 Compression=lzma2
 SolidCompression=yes
 WizardStyle=modern
@@ -55,12 +57,12 @@ Source: "..\config.example.toml"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\crates\svc\assets\LICENSE-MaterialIcons.txt"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
-Name: "{autoprograms}\rnetrbin - Lixeira de rede"; Filename: "{app}\{#ExeName}"
-Name: "{autodesktop}\rnetrbin - Lixeira de rede"; Filename: "{app}\{#ExeName}"; Tasks: desktopicon
+Name: "{autoprograms}\recycle-net"; Filename: "{app}\{#ExeName}"
+Name: "{autodesktop}\recycle-net"; Filename: "{app}\{#ExeName}"; Tasks: desktopicon
 
 [Run]
 ; shellexec: the exe asks for UAC itself when needed.
-Filename: "{app}\{#ExeName}"; Description: "Abrir o rnetrbin"; Flags: postinstall shellexec nowait skipifsilent
+Filename: "{app}\{#ExeName}"; Description: "Abrir o recycle-net"; Flags: postinstall shellexec nowait skipifsilent
 
 [Code]
 const
@@ -70,9 +72,13 @@ const
   ERROR_SERVICE_DOES_NOT_EXIST = 1060;
   STOP_TIMEOUT_SECS = 150; { the service may take up to 120 s to hand SNetRBin back }
   { Fixed paths of the service (crates\svc\src\config.rs CONFIG_PATH). }
-  CONFIG_PATH = 'C:\ProgramData\rnetrbin\config.toml';
-  SETUP_LOG = 'C:\ProgramData\rnetrbin\setup.log';
-  SENTINEL = '.rnetrbin-root';
+  CONFIG_PATH = 'C:\ProgramData\recycle-net\config.toml';
+  SETUP_LOG = 'C:\ProgramData\recycle-net\setup.log';
+  SENTINEL = '.recycle-net-root';
+  { v0.1.0 was called rnetrbin: service, data dir and recycle-dir marker. }
+  LEGACY_SERVICE = 'rnetrbin-svc';
+  LEGACY_CONFIG = 'C:\ProgramData\rnetrbin\config.toml';
+  LEGACY_SENTINEL = '.rnetrbin-root';
 
 var
   { Sticky across a Back + retry of PrepareToInstall: the first stop decides. }
@@ -148,11 +154,12 @@ end;
 
 procedure InitializeWizard();
 begin
-  ConfigExisted := FileExists(CONFIG_PATH);
+  { The legacy config is copied over in PrepareToInstall (MigrateLegacy). }
+  ConfigExisted := FileExists(CONFIG_PATH) or FileExists(LEGACY_CONFIG);
   BinPage := CreateInputDirPage(wpSelectDir, 'Pasta da lixeira',
-    'Onde o rnetrbin guarda as cópias dos arquivos apagados?',
+    'Onde o recycle-net guarda as cópias dos arquivos apagados?',
     'Escolha uma pasta nova ou vazia num disco local (não a raiz do disco). ' +
-    'As pastas protegidas são escolhidas depois, na janela do rnetrbin.',
+    'As pastas protegidas são escolhidas depois, na janela do recycle-net.',
     False, 'RecycleBinNet');
   BinPage.Add('');
   BinPage.Values[0] := ExpandConstant('{sd}\RecycleBinNet');
@@ -168,14 +175,15 @@ begin
   Result := RemoveBackslashUnlessRoot(Trim(BinPage.Values[0]));
 end;
 
-{ Same rule as config::ensure_dedicated_dir: new, empty, or already rnetrbin's. }
+{ Same rule as config::ensure_dedicated_dir: new, empty, or already recycle-net's. }
 function DirIsEmptyOrOurs(const Dir: String): Boolean;
 var
   F: TFindRec;
   More: Boolean;
 begin
   Result := True;
-  if (not DirExists(Dir)) or FileExists(AddBackslash(Dir) + SENTINEL) then
+  if (not DirExists(Dir)) or FileExists(AddBackslash(Dir) + SENTINEL)
+    or FileExists(AddBackslash(Dir) + LEGACY_SENTINEL) then
     Exit;
   if FindFirst(AddBackslash(Dir) + '*', F) then
   begin
@@ -283,6 +291,64 @@ begin
     RunSvc('uninstall', Ignored);
 end;
 
+{ The rnetrbin-svc.exe the legacy service runs ('' if there is none); the
+  ImagePath is `"<exe>" --service`. }
+function LegacyExe(): String;
+var
+  P: String;
+  I: Integer;
+begin
+  Result := '';
+  if not RegQueryStringValue(HKLM, 'SYSTEM\CurrentControlSet\Services\' + LEGACY_SERVICE, 'ImagePath', P) then
+    Exit;
+  P := Trim(P);
+  if Copy(P, 1, 1) = '"' then
+  begin
+    Delete(P, 1, 1);
+    I := Pos('"', P);
+  end else
+    I := Pos(' ', P);
+  if I > 0 then
+    P := Copy(P, 1, I - 1);
+  Result := P;
+end;
+
+{ Upgrade from v0.1.0 (rnetrbin): its service holds the driver port (one client
+  only), so it is removed first with its own exe, keeping the driver. Its config
+  is reused and its default install dir goes away. }
+function MigrateLegacy(): String;
+var
+  Exe, Output: String;
+  Code: Integer;
+begin
+  Result := '';
+  Exe := LegacyExe();
+  if Exe = '' then
+    Exit;
+  if FileExists(Exe) then
+  begin
+    Code := RunCapture(Exe, 'uninstall --keep-driver', Output);
+    if Code <> 0 then
+    begin
+      Result := Failure('Não foi possível remover a versão anterior (rnetrbin); nada foi instalado.', Output);
+      Exit;
+    end;
+  end else
+    Sc('delete ' + LEGACY_SERVICE);
+  if (not FileExists(CONFIG_PATH)) and FileExists(LEGACY_CONFIG) then
+  begin
+    ForceDirectories(ExtractFileDir(CONFIG_PATH));
+    if not FileCopy(LEGACY_CONFIG, CONFIG_PATH, True) then
+    begin
+      Result := Failure('Não foi possível copiar a configuração de ' + LEGACY_CONFIG + '; nada foi instalado.', '');
+      Exit;
+    end;
+  end;
+  if CompareText(ExtractFileDir(Exe), ExpandConstant('{autopf}\rnetrbin')) = 0 then
+    DelTree(ExtractFileDir(Exe), True, True, True);
+  AppendSetupLog('versão anterior (rnetrbin) removida; driver mantido');
+end;
+
 { A failure after [Files] cannot be rolled back (Inno finalizes the uninstaller
   first, and an exception in AfterInstall/ssPostInstall is only logged), so the
   driver and the service are installed HERE, from the exe extracted to the temp dir,
@@ -295,6 +361,9 @@ var
 begin
   Installed := False;
   Result := StopService();
+  if Result <> '' then
+    Exit;
+  Result := MigrateLegacy();
   if Result <> '' then
     Exit;
   try
@@ -319,7 +388,7 @@ begin
   if Code <> 0 then
   begin
     if ServiceExisted then
-      Result := Failure('A atualização do driver e do serviço falhou. Os arquivos do rnetrbin não ' +
+      Result := Failure('A atualização do driver e do serviço falhou. Os arquivos do recycle-net não ' +
         'foram trocados e o serviço anterior continua registrado.', Output)
     else
     begin
@@ -351,9 +420,9 @@ begin
   if (Code = 0) or (Code = ERROR_SERVICE_ALREADY_RUNNING) then
     ServiceWasRunning := False { started; DeinitializeSetup has nothing left to do }
   else
-    SuppressibleMsgBox('O rnetrbin foi instalado, mas o Windows não iniciou o serviço {#ServiceName} ' +
+    SuppressibleMsgBox('O recycle-net foi instalado, mas o Windows não iniciou o serviço {#ServiceName} ' +
       '(código ' + IntToStr(Code) + ').' + #13#10#13#10 +
-      'Veja C:\ProgramData\rnetrbin\rnetrbin-svc.log e use Iniciar em Configurações na janela do rnetrbin.',
+      'Veja C:\ProgramData\recycle-net\recycle-net.log e use Iniciar em Configurações na janela do recycle-net.',
       mbError, MB_OK, IDOK);
 end;
 
@@ -390,7 +459,7 @@ begin
     Exit;
   if Code <> 0 then
   begin
-    SuppressibleMsgBox('Não foi possível remover o serviço do rnetrbin (código ' + IntToStr(Code) + '). ' +
+    SuppressibleMsgBox('Não foi possível remover o serviço do recycle-net (código ' + IntToStr(Code) + '). ' +
       'Nada foi apagado. Pare o serviço e tente de novo.' + #13#10#13#10 + Output, mbError, MB_OK, IDOK);
     Result := False;
   end;
@@ -399,6 +468,6 @@ end;
 procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
 begin
   if (CurUninstallStep = usPostUninstall) and not UninstallSilent then
-    MsgBox('O serviço foi removido. A configuração e o índice em C:\ProgramData\rnetrbin ' +
+    MsgBox('O serviço foi removido. A configuração e o índice em C:\ProgramData\recycle-net ' +
       'e a pasta da lixeira foram mantidos; apague-os à mão se não precisar mais.', mbInformation, MB_OK);
 end;

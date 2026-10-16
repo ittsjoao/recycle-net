@@ -1,5 +1,5 @@
 # Pushing a tag vX.Y.Z (matching crates/svc/Cargo.toml) publishes a GitHub Release
-# with the installer and the bare exe.
+# with the installer.
 name: release
 
 on:
@@ -44,6 +44,5 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create $env:GITHUB_REF_NAME `
-            "target/installer/rnetrbin-setup-$env:VERSION.exe" `
-            target/release/rnetrbin-svc.exe `
-            --title "rnetrbin $env:VERSION" --generate-notes
+            "target/installer/recycle-net-setup-$env:VERSION.exe" `
+            --title "recycle-net $env:VERSION" --generate-notes

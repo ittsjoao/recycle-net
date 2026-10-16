@@ -11,8 +11,8 @@ use serde::{Deserialize, Serialize};
 pub const FILE_SYSTEM_SUBCATEGORY: &str = "{0CCE921D-69AE-11D9-BED3-505054503030}";
 /// Enough for ~290k audited operations at ~1.8 KB each (measured).
 pub const MIN_SECURITY_LOG_BYTES: u64 = 512 * 1024 * 1024;
-/// What existed before rnetrbin changed the audit policy (read by uninstall).
-pub const STATE_PATH: &str = r"C:\ProgramData\rnetrbin\audit-state.toml";
+/// What existed before recycle-net changed the audit policy (read by uninstall).
+pub const STATE_PATH: &str = r"C:\ProgramData\recycle-net\audit-state.toml";
 /// DELETE access right, as auditpol's hex access mask.
 const DELETE_MASK: &str = "0x10000";
 
@@ -31,7 +31,7 @@ pub struct AuditState {
 pub struct AuditStatus {
     /// "File System" success auditing is on right now (a GPO may turn it off).
     pub policy_success: bool,
-    /// rnetrbin configured auditing on this machine (state file exists).
+    /// recycle-net configured auditing on this machine (state file exists).
     pub configured: bool,
     /// The SACL covers BUILTIN\Users (no domain): every local user, more events.
     pub builtin_users: bool,
@@ -124,9 +124,9 @@ fn run(cmd: &str, args: &[String]) -> Result<String, String> {
 
 /// Current "Setting Value" of the File System subcategory (Err when the backup cannot be parsed).
 fn current_setting() -> Result<u8, String> {
-    // Not %TEMP%: as SYSTEM a predictable name there could be pre-planted. ProgramData\rnetrbin
+    // Not %TEMP%: as SYSTEM a predictable name there could be pre-planted. ProgramData\recycle-net
     // is ours; the name is unique per process and instant, and any leftover is removed first.
-    let dir = Path::new(STATE_PATH).parent().unwrap_or(Path::new(r"C:\ProgramData\rnetrbin"));
+    let dir = Path::new(STATE_PATH).parent().unwrap_or(Path::new(r"C:\ProgramData\recycle-net"));
     std::fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let nanos = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
     let file = dir.join(format!("auditpol-{}-{nanos}.csv", std::process::id()));

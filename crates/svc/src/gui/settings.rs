@@ -107,7 +107,7 @@ pub fn audit_text(a: &AuditStatus) -> &'static str {
 /// Note under the settings: where the config lives, or how to get the service back.
 pub fn service_note(svc: SvcState, exe: &str) -> String {
     if svc == SvcState::NotInstalled {
-        "Serviço não instalado. Reinstale o rnetrbin pelo setup.".into()
+        "Serviço não instalado. Reinstale o recycle-net pelo setup.".into()
     } else {
         format!(
             "Configuração gravada em {CONFIG_PATH}. Salvar com o serviço rodando o reinicia. \
@@ -159,7 +159,7 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
         ribbon,
         column![
             field("Pasta da lixeira", r"E:\Lixeira", &app.form.recycle_dir, Field::RecycleDir),
-            field("Arquivo do índice", r"C:\ProgramData\rnetrbin\index.db", &app.form.db_path, Field::DbPath),
+            field("Arquivo do índice", r"C:\ProgramData\recycle-net\index.db", &app.form.db_path, Field::DbPath),
             field("Limite da lixeira (GB)", "10", &app.form.max_gb, Field::MaxGb),
             field("Apagar backups após (dias)", "vazio = sem limite", &app.form.max_age_days, Field::MaxAgeDays),
             row![
@@ -182,7 +182,7 @@ pub(super) fn view(app: &App) -> Element<'_, Msg> {
             text(service_note(app.svc, &exe)).size(12).color(if app.svc == SvcState::NotInstalled { p.danger } else { p.muted }),
             text("Fechar esta janela não para o serviço; a proteção continua rodando.").size(12).color(p.muted),
             Space::new().height(Length::Fill),
-            text(format!("rnetrbin {} · Ícones: Material Icons, Google (Apache 2.0)", env!("CARGO_PKG_VERSION")))
+            text(format!("recycle-net {} · Ícones: Material Icons, Google (Apache 2.0)", env!("CARGO_PKG_VERSION")))
                 .size(11)
                 .color(p.muted),
         ]
@@ -198,9 +198,9 @@ mod tests {
 
     #[test]
     fn not_installed_service_points_to_the_setup() {
-        assert_eq!(service_note(SvcState::NotInstalled, r"C:\x.exe"), "Serviço não instalado. Reinstale o rnetrbin pelo setup.");
-        let n = service_note(SvcState::Running, r"C:\Arquivos\rnetrbin-svc.exe");
-        assert!(n.contains(r"C:\Arquivos\rnetrbin-svc.exe"));
+        assert_eq!(service_note(SvcState::NotInstalled, r"C:\x.exe"), "Serviço não instalado. Reinstale o recycle-net pelo setup.");
+        let n = service_note(SvcState::Running, r"C:\Arquivos\recycle-net.exe");
+        assert!(n.contains(r"C:\Arquivos\recycle-net.exe"));
         assert!(!n.contains("Instalar"));
     }
 

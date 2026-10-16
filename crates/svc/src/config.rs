@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Fixed location read by the service and written by the GUI.
-pub const CONFIG_PATH: &str = r"C:\ProgramData\rnetrbin\config.toml";
+pub const CONFIG_PATH: &str = r"C:\ProgramData\recycle-net\config.toml";
 
 /// One protected folder: a deleted file under `path` (subfolders included) goes to
 /// the bin when its name matches some `include` mask and no `exclude` mask.
@@ -49,7 +49,7 @@ impl Default for Config {
     fn default() -> Self {
         Config {
             recycle_dir: r"D:\RecycleBinNet".into(),
-            db_path: r"C:\ProgramData\rnetrbin\index.db".into(),
+            db_path: r"C:\ProgramData\recycle-net\index.db".into(),
             max_bin_bytes: 10 * 1024 * 1024 * 1024,
             max_age_days: None,
             theme: ThemeName::Rust,
@@ -108,28 +108,30 @@ pub enum ConfigError {
     #[error("invalid: {0}")] Invalid(String),
 }
 
-/// Marker file proving a directory is owned by rnetrbin. Quota eviction only
+/// Marker file proving a directory is owned by recycle-net. Quota eviction only
 /// ever deletes indexed backups, but the sentinel also stops the service from
 /// starting against a populated directory it did not create (a drive root, a
 /// share root, or another tool's bin).
-pub const SENTINEL: &str = ".rnetrbin-root";
+pub const SENTINEL: &str = ".recycle-net-root";
+/// Marker written before the rename to recycle-net (v0.1.0); still accepted.
+pub const LEGACY_SENTINEL: &str = ".rnetrbin-root";
 
-/// Create `dir` if needed and mark it as rnetrbin's. A directory that already
+/// Create `dir` if needed and mark it as recycle-net's. A directory that already
 /// exists is accepted only if it is marked, or empty (then it gets marked).
 pub fn ensure_dedicated_dir(dir: &Path) -> Result<(), ConfigError> {
     std::fs::create_dir_all(dir)?;
     let sentinel = dir.join(SENTINEL);
-    if sentinel.exists() {
+    if sentinel.exists() || dir.join(LEGACY_SENTINEL).exists() {
         return Ok(());
     }
     if std::fs::read_dir(dir)?.next().is_some() {
         return Err(ConfigError::Invalid(format!(
             "recycle_dir {} is not empty and has no {SENTINEL} marker; refusing to manage it \
-             (create the marker manually only if this directory is dedicated to rnetrbin)",
+             (create the marker manually only if this directory is dedicated to recycle-net)",
             dir.display()
         )));
     }
-    std::fs::write(&sentinel, b"rnetrbin recycle root\n")?;
+    std::fs::write(&sentinel, b"recycle-net recycle root\n")?;
     Ok(())
 }
 
@@ -251,7 +253,7 @@ impl Config {
 
 /// `init-config`: write `Config::initial(recycle_dir)` to `path` unless a file is
 /// already there, creating and marking the recycle dir. Nothing is written when
-/// the path is invalid or the dir is populated and not rnetrbin's.
+/// the path is invalid or the dir is populated and not recycle-net's.
 pub fn init_config(path: &Path, recycle_dir: &Path) -> Result<InitConfig, ConfigError> {
     if path.exists() {
         return Ok(InitConfig::AlreadyExists);
@@ -271,7 +273,7 @@ mod tests {
     fn parses_toml_with_folder_tables_and_theme() {
         let t = r#"
 recycle_dir = 'E:\Lixeira'
-db_path = 'C:\ProgramData\rnetrbin\index.db'
+db_path = 'C:\ProgramData\recycle-net\index.db'
 max_bin_bytes = 10737418240
 theme = "preto"
 
@@ -347,7 +349,7 @@ include = ["*.xml", "*.pdf"]
     fn driver_masks_follow_the_spec_table() {
         let mut c = Config {
             recycle_dir: r"E:\Lixeira".into(),
-            db_path: r"C:\ProgramData\rnetrbin\index.db".into(),
+            db_path: r"C:\ProgramData\recycle-net\index.db".into(),
             folders: vec![
                 rule(r"d:/Dados/Contabil/", &["*.*"], &["*.bak", "~$*"]),
                 rule(r"D:\Dados\Fiscal", &["*.xml", "Relatorio.pdf"], &[]),
@@ -367,7 +369,7 @@ include = ["*.xml", "*.pdf"]
         assert_eq!(exc, [
             r"\D:\DADOS\CONTABIL\*.BAK",
             r"\D:\DADOS\CONTABIL\~$*", r"\D:\DADOS\CONTABIL\*\~$*",
-            r"\E:\LIXEIRA\*", r"\C:\PROGRAMDATA\RNETRBIN\INDEX.DB*",
+            r"\E:\LIXEIRA\*", r"\C:\PROGRAMDATA\RECYCLE-NET\INDEX.DB*",
         ]);
     }
     #[test]
@@ -396,11 +398,11 @@ include = ["*.xml", "*.pdf"]
     fn normalize_fixes_slashes_and_trailing_separator() {
         let mut c = ok_cfg();
         c.recycle_dir = "d:/RecycleBinNet/".into();
-        c.db_path = "D:/rnetrbin/index.db".into();
+        c.db_path = "D:/recycle-net/index.db".into();
         c.normalize().unwrap();
         c.validate().unwrap();
         assert_eq!(c.recycle_dir, PathBuf::from("D:\\RecycleBinNet"));
-        assert_eq!(c.db_path, PathBuf::from("D:\\rnetrbin\\index.db"));
+        assert_eq!(c.db_path, PathBuf::from("D:\\recycle-net\\index.db"));
     }
     #[test]
     fn db_path_must_be_drive_absolute() {
@@ -432,6 +434,13 @@ include = ["*.xml", "*.pdf"]
         std::fs::write(t.path().join("user-data.xlsx"), b"x").unwrap();
         assert!(ensure_dedicated_dir(t.path()).is_err());
         assert!(!t.path().join(SENTINEL).exists());
+    }
+    #[test]
+    fn dedicated_dir_accepts_legacy_marker() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join(LEGACY_SENTINEL), b"x").unwrap();
+        std::fs::write(t.path().join("backup.bin"), b"x").unwrap();
+        ensure_dedicated_dir(t.path()).unwrap();
     }
 }
 

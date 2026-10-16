@@ -1,8 +1,8 @@
-# Builds target\release\rnetrbin-svc.exe and compiles the Inno Setup installer into
-# target\installer\rnetrbin-setup-<version>.exe.
+# Builds target\release\recycle-net.exe and compiles the Inno Setup installer into
+# target\installer\recycle-net-setup-<version>.exe.
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent $PSScriptRoot
-$exe = Join-Path $root 'target\release\rnetrbin-svc.exe'
+$exe = Join-Path $root 'target\release\recycle-net.exe'
 
 # A running window or service keeps the exe locked and cargo would fail late.
 if (Test-Path $exe) {
@@ -30,11 +30,11 @@ Push-Location $root
 try {
     cargo build --release
     if ($LASTEXITCODE -ne 0) { throw "cargo build --release falhou ($LASTEXITCODE)" }
-    & $iscc /Q "/DAppVersion=$version" (Join-Path $PSScriptRoot 'rnetrbin.iss')
+    & $iscc /Q "/DAppVersion=$version" (Join-Path $PSScriptRoot 'recycle-net.iss')
     if ($LASTEXITCODE -ne 0) { throw "ISCC falhou ($LASTEXITCODE)" }
 } finally {
     Pop-Location
 }
 
-$out = Join-Path $root "target\installer\rnetrbin-setup-$version.exe"
+$out = Join-Path $root "target\installer\recycle-net-setup-$version.exe"
 Write-Host "Instalador: $out ($([math]::Round((Get-Item $out).Length / 1MB, 1)) MB)"

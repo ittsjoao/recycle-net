@@ -249,7 +249,7 @@ impl App {
                 app.notify(format!("{} Corrija em Configurações.", messages::config(&e)), Kind::Error)
             }
             Err(_) => app.notify(
-                format!("Configuração {CONFIG_PATH} não encontrada. Reinstale o rnetrbin pelo setup."),
+                format!("Configuração {CONFIG_PATH} não encontrada. Reinstale o recycle-net pelo setup."),
                 Kind::Error,
             ),
         }
@@ -270,7 +270,7 @@ impl App {
 
     fn title(&self) -> String {
         let host = std::env::var("COMPUTERNAME").unwrap_or_default();
-        format!("rnetrbin - Lixeira de rede - {host}")
+        format!("recycle-net - {host}")
     }
 
     fn theme(&self) -> Theme {

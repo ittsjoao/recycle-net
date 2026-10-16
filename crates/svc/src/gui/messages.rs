@@ -81,7 +81,7 @@ fn invalid(m: &str) -> String {
         return format!("As pastas {a} e {b} se sobrepõem (uma está dentro da outra); proteja só uma delas.");
     }
     if let Some(dir) = m.strip_prefix("recycle_dir ").and_then(|r| r.split_once(" is not empty")).map(|(d, _)| d) {
-        return format!("A pasta da lixeira {dir} já tem arquivos e não foi criada pelo rnetrbin; escolha uma pasta vazia.");
+        return format!("A pasta da lixeira {dir} já tem arquivos e não foi criada pelo recycle-net; escolha uma pasta vazia.");
     }
     match m {
         "max_bin_bytes must be > 0" => "O limite da lixeira deve ser maior que zero.".into(),
@@ -97,13 +97,13 @@ fn invalid(m: &str) -> String {
 pub fn service(raw: &str) -> String {
     let low = raw.to_lowercase();
     if low.contains("0x80070005") || low.contains("acesso negado") || low.contains("access is denied") {
-        "Sem permissão para controlar o serviço; abra o rnetrbin como administrador.".into()
+        "Sem permissão para controlar o serviço; abra o recycle-net como administrador.".into()
     } else if low.contains("is not installed") || low.contains("0x80070424") {
         "O serviço não está instalado.".into()
     } else if low.starts_with("timed out") {
         "O serviço demorou demais para parar; tente de novo em instantes.".into()
     } else if low.contains("0x8007041d") {
-        r"O serviço não respondeu ao iniciar; veja o log em C:\ProgramData\rnetrbin\rnetrbin-svc.log.".into()
+        r"O serviço não respondeu ao iniciar; veja o log em C:\ProgramData\recycle-net\recycle-net.log.".into()
     } else if low.contains("0x80070422") {
         "O serviço está desativado no Windows; ative-o em services.msc.".into()
     } else {
@@ -199,7 +199,7 @@ mod tests {
 
     #[test]
     fn populated_unmarked_recycle_dir_is_explained() {
-        let dir = std::env::temp_dir().join(format!("rnetrbin-msg-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("recycle-net-msg-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("other.txt"), b"x").unwrap();
         let e = crate::config::ensure_dedicated_dir(&dir).unwrap_err();
@@ -207,7 +207,7 @@ mod tests {
         assert_eq!(
             config(&e),
             format!(
-                "A pasta da lixeira {} já tem arquivos e não foi criada pelo rnetrbin; escolha uma pasta vazia.",
+                "A pasta da lixeira {} já tem arquivos e não foi criada pelo recycle-net; escolha uma pasta vazia.",
                 dir.display()
             )
         );
@@ -225,14 +225,14 @@ mod tests {
         assert_eq!(clean("Acesso negado. (0x80070005)"), "Acesso negado");
         assert_eq!(
             service("open SCM: Acesso negado. (0x80070005) (run as Administrator)"),
-            "Sem permissão para controlar o serviço; abra o rnetrbin como administrador."
+            "Sem permissão para controlar o serviço; abra o recycle-net como administrador."
         );
-        assert_eq!(service("rnetrbin-svc is not installed"), "O serviço não está instalado.");
+        assert_eq!(service("recycle-net is not installed"), "O serviço não está instalado.");
         assert_eq!(
-            service("timed out waiting for rnetrbin-svc to stop"),
+            service("timed out waiting for recycle-net to stop"),
             "O serviço demorou demais para parar; tente de novo em instantes."
         );
-        assert_eq!(service("start rnetrbin-svc: Falhou. (0x8007041D)"), "O serviço não respondeu ao iniciar; veja o log em C:\\ProgramData\\rnetrbin\\rnetrbin-svc.log.");
+        assert_eq!(service("start recycle-net: Falhou. (0x8007041D)"), "O serviço não respondeu ao iniciar; veja o log em C:\\ProgramData\\recycle-net\\recycle-net.log.");
         assert_eq!(service("start x: Algo estranho. (0x80070001)"), "O serviço do Windows recusou a operação: Algo estranho.");
     }
 

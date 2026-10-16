@@ -41,7 +41,7 @@ const WATCHER_HEALTHY: Duration = Duration::from_secs(60);
 
 pub const START_AUTO: u32 = 2;
 pub const START_DISABLED: u32 = 4;
-pub const STATE_PATH: &str = r"C:\ProgramData\rnetrbin\takeover.json";
+pub const STATE_PATH: &str = r"C:\ProgramData\recycle-net\takeover.json";
 
 /// Capped exponential backoff: 1s, 2s, 4s, ... capped at 60s.
 pub fn backoff_delay(attempt: u32) -> Duration {
@@ -696,7 +696,7 @@ impl Scm for WinScm {
         use windows::Win32::System::Services::*;
         unsafe {
             let scm = OpenSCManagerW(None, None, SC_MANAGER_CONNECT).map_err(|e| format!("open SCM: {e}"))?;
-            let svc = OpenServiceW(scm, w!("rnetrbin-svc"), SERVICE_CHANGE_CONFIG)
+            let svc = OpenServiceW(scm, w!("recycle-net"), SERVICE_CHANGE_CONFIG)
                 .map_err(|e| format!("open self: {e}"))?;
             // Restart after 60s on each of the first failures; reset the count daily.
             let mut actions = [

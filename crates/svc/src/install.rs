@@ -1,6 +1,6 @@
 //! Standalone install: ship our own copy of `netrbin.sys` (embedded at build
 //! time, see build.rs), register it as a minifilter exactly as the original installer does, and register
-//! `rnetrbin-svc`. The original product (SNetRBin) is not required; when it is
+//! `recycle-net`. The original product (SNetRBin) is not required; when it is
 //! present, uninstall leaves the shared driver in place for it.
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -15,8 +15,8 @@ pub const INSTANCE_NAME: &str = "netrbin Instance";
 pub const ALTITUDE: &str = "370150";
 pub const INSTANCE_FLAGS: u32 = 0;
 
-pub const OWN_SERVICE: &str = "rnetrbin-svc";
-pub const OWN_DISPLAY_NAME: &str = "rnetrbin network recycle bin";
+pub const OWN_SERVICE: &str = "recycle-net";
+pub const OWN_DISPLAY_NAME: &str = "recycle-net";
 pub const ORIGINAL_SERVICE: &str = "SNetRBin";
 
 /// The driver image packaged into this binary by build.rs.
@@ -138,7 +138,7 @@ pub fn describe(e: &InstallError) -> String {
         }
         InstallError::OverrideWhileLoaded => {
             return "O driver netrbin está carregado; para trocá-lo com --driver, rode \
-                    \"rnetrbin-svc.exe uninstall\" (ou reinicie) antes."
+                    \"recycle-net.exe uninstall\" (ou reinicie) antes."
                 .into()
         }
         InstallError::Step { step, msg } => (*step, msg.as_str()),
@@ -149,8 +149,8 @@ pub fn describe(e: &InstallError) -> String {
         "query driver" => "consultar o driver netrbin",
         "enable driver" => "reativar o driver netrbin (início no boot)",
         "load driver" => "carregar o driver netrbin.sys",
-        "register service" => "registrar o serviço rnetrbin-svc",
-        "remove service" => "remover o serviço rnetrbin-svc",
+        "register service" => "registrar o serviço recycle-net",
+        "remove service" => "remover o serviço recycle-net",
         "query SNetRBin" => "consultar o serviço SNetRBin",
         "delete driver service" => "remover o registro do driver netrbin",
         "remove driver file" => "apagar o arquivo netrbin.sys",
@@ -166,7 +166,7 @@ pub fn describe(e: &InstallError) -> String {
         ("load driver", Some(577 | 1275)) => Some(HVCI_HINT),
         (_, Some(5)) => Some("Rode o setup (ou o comando) como administrador."),
         ("copy driver", Some(32)) => {
-            Some("O netrbin.sys em uso já está carregado; rode \"rnetrbin-svc.exe uninstall\" ou reinicie e tente de novo.")
+            Some("O netrbin.sys em uso já está carregado; rode \"recycle-net.exe uninstall\" ou reinicie e tente de novo.")
         }
         _ => None,
     };
@@ -195,10 +195,10 @@ pub trait Host {
     /// Ok(true) when Windows answered "already running" (0x420), which it also
     /// says for a driver stuck stopping.
     fn start_driver(&self) -> Result<bool, String>;
-    /// Create `rnetrbin-svc` (auto start) pointing at `exe`, or repoint an existing
+    /// Create `recycle-net` (auto start) pointing at `exe`, or repoint an existing
     /// one (its start type is kept).
     fn ensure_own_service(&self, exe: &Path) -> Result<(), String>;
-    /// Stop (waiting for the handback) and delete `rnetrbin-svc`; absent is Ok.
+    /// Stop (waiting for the handback) and delete `recycle-net`; absent is Ok.
     fn remove_own_service(&self) -> Result<(), String>;
     /// Whether the original SNetRBin service is installed.
     fn original_present(&self) -> Result<bool, String>;
@@ -366,7 +366,7 @@ pub fn set_service_autostart(name: &str, on: bool) -> Result<(), String> {
     .map_err(|e| format!("change config {name}: {e}"))
 }
 
-/// Stop `rnetrbin-svc` and wait for it; not running is Ok.
+/// Stop `recycle-net` and wait for it; not running is Ok.
 pub fn stop_own_service() -> Result<(), String> {
     win::stop(OWN_SERVICE, OWN_STOP_TIMEOUT)
 }
@@ -887,7 +887,7 @@ mod tests {
         assert_eq!(describe(&e), r"O driver indicado em --driver (C:\x\a.dll) é inválido: expected a .sys file.");
     }
 
-    const EXE: &str = r"C:\x\rnetrbin-svc.exe";
+    const EXE: &str = r"C:\x\recycle-net.exe";
 
     #[test]
     fn fresh_install_writes_driver_and_checks_it_loaded() {

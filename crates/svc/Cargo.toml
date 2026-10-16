@@ -1,14 +1,14 @@
 [package]
-name = "rnetrbin-svc"
+name = "recycle-net"
 version = "0.1.0"
 edition = "2021"
 
 [lib]
-name = "rnetrbin_svc"
+name = "recycle_net"
 path = "src/lib.rs"
 
 [[bin]]
-name = "rnetrbin-svc"
+name = "recycle-net"
 path = "src/main.rs"
 
 [dependencies]

@@ -1,19 +1,23 @@
+// GUI subsystem: opening the window never flashes a console. The CLI borrows the
+// caller's console instead (attach_console).
+#![windows_subsystem = "windows"]
+
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use rnetrbin_svc::config::{self, Config, CONFIG_PATH};
-use rnetrbin_svc::{install, service};
+use recycle_net::config::{self, Config, CONFIG_PATH};
+use recycle_net::{install, service};
 use windows_service::service::{
     ServiceControl, ServiceControlAccept, ServiceExitCode, ServiceState, ServiceStatus, ServiceType,
 };
 use windows_service::service_control_handler::{self, ServiceControlHandlerResult, ServiceStatusHandle};
 use windows_service::{define_windows_service, service_dispatcher};
 
-const SERVICE_NAME: &str = "rnetrbin-svc";
-const LOG_PATH: &str = r"C:\ProgramData\rnetrbin\rnetrbin-svc.log";
+const SERVICE_NAME: &str = "recycle-net";
+const LOG_PATH: &str = r"C:\ProgramData\recycle-net\recycle-net.log";
 
 define_windows_service!(ffi_service_main, service_main);
 
@@ -155,7 +159,7 @@ fn run_init_config(args: &[String]) -> Result<(), String> {
         .iter()
         .position(|a| a == "--recycle-dir")
         .and_then(|i| args.get(i + 1))
-        .ok_or(r"uso: rnetrbin-svc init-config --recycle-dir <pasta, ex. D:\RecycleBinNet>")?;
+        .ok_or(r"uso: recycle-net init-config --recycle-dir <pasta, ex. D:\RecycleBinNet>")?;
     match config::init_config(Path::new(CONFIG_PATH), Path::new(dir)) {
         Ok(config::InitConfig::Created) => println!("configuração criada em {CONFIG_PATH} (lixeira em {dir}, nenhuma pasta protegida)"),
         Ok(config::InitConfig::AlreadyExists) => println!("configuração já existe em {CONFIG_PATH}; mantida"),
@@ -164,14 +168,14 @@ fn run_init_config(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
-/// `install [--driver <netrbin.sys>] [--exe <rnetrbin-svc.exe>]`: installs the
+/// `install [--driver <netrbin.sys>] [--exe <recycle-net.exe>]`: installs the
 /// embedded driver unless overridden and points the service at `--exe` (default: this exe). The config must already be valid, so the service never starts
 /// against a config it would reject. Errors come back as pt-BR text for humans.
 fn run_install(args: &[String]) -> Result<(), String> {
     init_cli_logging();
     let driver = match args.iter().position(|a| a == "--driver") {
         Some(i) => {
-            let p = args.get(i + 1).ok_or(r"uso: rnetrbin-svc install [--driver <caminho\netrbin.sys>]")?;
+            let p = args.get(i + 1).ok_or(r"uso: recycle-net install [--driver <caminho\netrbin.sys>]")?;
             Some(install::read_driver_override(Path::new(p)).map_err(|e| install::describe(&e))?)
         }
         None => None,
@@ -180,7 +184,7 @@ fn run_install(args: &[String]) -> Result<(), String> {
         .map_err(|e| format!("A configuração {CONFIG_PATH} está ausente ou inválida.\nDetalhe técnico: {e}"))?;
     // The setup runs a copy from its temp dir, so the service path comes from --exe.
     let exe = match args.iter().position(|a| a == "--exe") {
-        Some(i) => args.get(i + 1).map(PathBuf::from).ok_or(r"uso: rnetrbin-svc install [--exe <caminho\rnetrbin-svc.exe>]")?,
+        Some(i) => args.get(i + 1).map(PathBuf::from).ok_or(r"uso: recycle-net install [--exe <caminho\recycle-net.exe>]")?,
         None => std::env::current_exe().map_err(|e| format!("Não foi possível localizar o executável: {e}"))?,
     };
     println!("instalando o driver e o serviço (serviço aponta para {})", exe.display());
@@ -204,19 +208,25 @@ fn run_uninstall(args: &[String]) -> Result<(), String> {
         install::Uninstalled::DriverRemoved => println!("serviço e driver netrbin removidos"),
         install::Uninstalled::RebootRequired => println!("serviço removido; reinicie para terminar de remover o driver"),
     }
-    if let Err(e) = rnetrbin_svc::audit::setup::undo() {
+    if let Err(e) = recycle_net::audit::setup::undo() {
         eprintln!("aviso: não foi possível desfazer a configuração de auditoria: {e}");
     }
     Ok(())
 }
 
-/// Console exe (so CLI output and exit codes work in cmd/PowerShell): when
-/// opened by double click the console exists only for us, so drop it.
-fn detach_own_console() {
-    use windows::Win32::System::Console::{FreeConsole, GetConsoleProcessList};
-    let mut ids = [0u32; 2];
-    if unsafe { GetConsoleProcessList(&mut ids) } == 1 {
-        let _ = unsafe { FreeConsole() };
+/// A GUI-subsystem exe starts without a console. Redirected output (the setup
+/// captures it through pipes) already works; otherwise write to the console of
+/// whoever ran us, or to a new one for `--console` started outside a terminal.
+fn attach_console(need_one: bool) {
+    use windows::Win32::System::Console::{
+        AllocConsole, AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_ERROR_HANDLE, STD_OUTPUT_HANDLE,
+    };
+    let redirected = |id| unsafe { GetStdHandle(id) }.is_ok_and(|h| !h.is_invalid() && !h.0.is_null());
+    if redirected(STD_OUTPUT_HANDLE) || redirected(STD_ERROR_HANDLE) {
+        return;
+    }
+    if unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }.is_err() && need_one {
+        let _ = unsafe { AllocConsole() };
     }
 }
 
@@ -258,12 +268,11 @@ fn relaunch_elevated() -> Result<bool, Box<dyn std::error::Error>> {
 }
 
 fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
-    detach_own_console();
     if !is_elevated() {
         relaunch_elevated()?;
         return Ok(());
     }
-    rnetrbin_svc::gui::run()?;
+    recycle_net::gui::run()?;
     Ok(())
 }
 
@@ -286,6 +295,7 @@ fn main() {
         }
         return;
     }
+    attach_console(args.get(1).map(String::as_str) == Some("--console"));
     let sub = match args.get(1).map(String::as_str) {
         Some("install") => Some(run_install(&args)),
         Some("uninstall") => Some(run_uninstall(&args)),

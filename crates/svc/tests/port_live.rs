@@ -1,6 +1,6 @@
 // Requires the netrbin driver loaded and SNetRBin stopped. Run with:
-//   cargo test -p rnetrbin-svc --test port_live -- --ignored
-use rnetrbin_svc::port::PortClient;
+//   cargo test -p recycle-net --test port_live -- --ignored
+use recycle_net::port::PortClient;
 
 #[test]
 #[ignore]
