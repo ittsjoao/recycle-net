@@ -1,5 +1,4 @@
 ﻿; rnetrbin installer (Inno Setup 6). Build with installer\build.ps1.
-; Internal use only: the exe embeds the third-party netrbin.sys (see AGENTS.md).
 ; Setup installs everything: on a first install it asks for the recycle-bin folder and
 ; writes a config with zero protected folders (`init-config`), then registers and loads
 ; the driver and registers the service (`install`, see PrepareToInstall) and starts it.
@@ -38,6 +37,7 @@ ArchitecturesInstallIn64BitMode=x64compatible
 OutputDir=..\target\installer
 OutputBaseFilename=rnetrbin-setup-{#AppVersion}
 UninstallDisplayIcon={app}\{#ExeName}
+SetupIconFile=..\icons\rnetrbin.ico
 UninstallDisplayName=rnetrbin - Lixeira de rede
 Compression=lzma2
 SolidCompression=yes

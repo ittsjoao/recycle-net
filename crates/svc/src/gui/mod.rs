@@ -31,11 +31,22 @@ pub fn run() -> iced::Result {
         .theme(App::theme)
         .subscription(App::subscription)
         .font(icons::FONT_BYTES)
-        .window_size((1150.0, 720.0))
+        .window(iced::window::Settings {
+            size: iced::Size::new(1150.0, 720.0),
+            icon: window_icon(),
+            ..Default::default()
+        })
         // Closing waits for a running job (e.g. the stop+start of Salvar) so the
         // service is never left stopped; see Msg::CloseRequested.
         .exit_on_close_request(false)
         .run()
+}
+
+/// Titlebar/taskbar icon: winit ignores the exe's icon resource, so the window
+/// gets the same image as raw RGBA (decoded by build.rs).
+fn window_icon() -> Option<iced::window::Icon> {
+    let rgba = include_bytes!(concat!(env!("OUT_DIR"), "/icon.rgba"));
+    iced::window::icon::from_rgba(rgba.to_vec(), 256, 256).ok()
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
