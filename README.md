@@ -10,6 +10,8 @@ para ver quem apagou e restaurar.
 Funciona como um serviço do Windows (`recycle-net`) junto com o minifilter
 `netrbin.sys`, que já vem embutido no exe.
 
+<p align="center"><img src="gif/recycle-net-use.gif" alt="Arquivo apagado no compartilhamento \\SERVIDOR\Dados e restaurado pela janela do recycle-net" width="800"></p>
+
 ## Download
 
 Baixe o `recycle-net-setup-X.Y.Z.exe` da última versão em
